@@ -1,5 +1,6 @@
 # Bibliotecas importadas
 import polars as pl
+from pathlib import Path
 
 
 def compute_survival_columns(df_clinical: pl.DataFrame) -> pl.DataFrame:
