@@ -9,8 +9,9 @@ def _():
     import marimo as mo
     import filter as f
     import polars as pl
+    from lasso_analysis import lasso
 
-    return (pl,)
+    return lasso, pl
 
 
 @app.cell
@@ -30,7 +31,9 @@ def _():
 
 
 @app.cell
-def _():
+def _(lasso, patients_table):
+    #Calculando os genes com o laço 
+    selected_genes, c_index = lasso(patients_table)
     return
 
 
