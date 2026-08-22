@@ -85,35 +85,35 @@ def _(pl):
     return (compute_survival_columns,)
 
 
-app._unparsable_cell(
-    """
+@app.cell
+def _(Path):
     def find_paths(selected_files_names:list[str]) -> list[str]:
-    \"\"\"
+        """
         Recebe uma lista com os nomes dos arquivos procurados e devolve uma lista 
         com os caminhos completos (paths em string) de onde eles estão no sistema.
 
         Regras:
-          - Define o diretório alvo como a pasta \"rna_files\" no diretório atual.
-          - Se a pasta \"rna_files\" não for encontrada, avisa no console e retorna lista vazia.
+          - Define o diretório alvo como a pasta "rna_files" no diretório atual.
+          - Se a pasta "rna_files" não for encontrada, avisa no console e retorna lista vazia.
           - Converte os nomes procurados para um 'set' (conjunto) para deixar a checagem 
             muito mais rápida (busca O(1)).
-          - Itera recursivamente (rglob) por todos os arquivos de extensão \".tsv\" dentro da pasta.
+          - Itera recursivamente (rglob) por todos os arquivos de extensão ".tsv" dentro da pasta.
           - Quando encontra um arquivo desejado: guarda o caminho final, remove ele do 
             conjunto de busca e continua.
           - Otimização (Early Exit): Se o conjunto de busca ficar vazio (ou seja, já encontrou 
             todos os arquivos do paciente), interrompe o laço imediatamente para poupar processamento.
-        \"\"\"
+        """
         current_dir = Path('.')
-        path = current_dir / \"rna_files\"
+        path = current_dir / "rna_files"
 
         if not path.is_dir():
-            print(\"Diretório rna_files não encontrado\")
+            print("Diretório rna_files não encontrado")
             return []
 
         files_to_find = set(selected_files_names)
         found_paths = []
 
-        for file in path.rglob(\"*.tsv\"):
+        for file in path.rglob("*.tsv"):
             if file.name in files_to_find:
                 found_paths.append(str(file))
                 files_to_find.remove(file.name)
@@ -121,22 +121,21 @@ app._unparsable_cell(
                     break
 
         return found_paths
-    """,
-    name="_"
-)
+
+    return (find_paths,)
 
 
-app._unparsable_cell(
-    """
+@app.cell
+def _(pl):
     def get_rna_exp(file_paths:list[str])->dict:
-    \"\"\"
+        """
         Recebe uma lista de caminhos de arquivos de RNA e devolve um dicionário com:
             gene_name (chave) | stranded_second média (valor float)
 
         Regras:
           - Se a lista de arquivos estiver vazia, retorna um dicionário vazio.
           - Remove estatísticas de alinhamento que não são genes reais 
-            (ex: \"N_unmapped\", \"N_multimapping\", etc.).
+            (ex: "N_unmapped", "N_multimapping", etc.).
           - Para cada arquivo na lista (iteração):
               * Lê o arquivo de forma preguiçosa (lazy) ignorando o cabeçalho (skip_rows=1).
               * Filtra descartando as linhas indesejadas listadas em 'remove'.
@@ -145,36 +144,35 @@ app._unparsable_cell(
           - Como o paciente pode ter múltiplos arquivos com o mesmo gene, faz um agrupamento final 
             pelo nome do gene, calculando a MÉDIA da expressão ('stranded_second') entre os arquivos.
           - Converte o resultado final em um dicionário (chave = gene_name, valor = stranded_second).
-        \"\"\"
-    
+        """
+
         if not file_paths:
             return {}
 
         #Remove colunas indesejáveis
-        remove = [\"N_unmapped\", \"N_multimapping\", \"N_noFeature\", \"N_ambiguous\"]
-    
+        remove = ["N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"]
+
         lazy_reads = []
         for current_path in file_paths:
             lf = (
-                pl.scan_csv(current_path, separator=\"\\t\", skip_rows=1)
-                .filter(~pl.col(\"gene_id\").is_in(remove))
-                .group_by(\"gene_name\")
-                .agg(pl.col(\"stranded_second\").sum())
+                pl.scan_csv(current_path, separator="\t", skip_rows=1)
+                .filter(~pl.col("gene_id").is_in(remove))
+                .group_by("gene_name")
+                .agg(pl.col("stranded_second").sum())
             )
             lazy_reads.append(lf)
 
         #Processa todos os arquivos juntos e tira a média geral de cada gene
         final_result = (
             pl.concat(lazy_reads)
-            .group_by(\"gene_name\")
-            .agg(pl.col(\"stranded_second\").mean())
+            .group_by("gene_name")
+            .agg(pl.col("stranded_second").mean())
             .collect()
         )
 
-        return dict(zip(final_result[\"gene_name\"], final_result[\"stranded_second\"]))
-    """,
-    name="_"
-)
+        return dict(zip(final_result["gene_name"], final_result["stranded_second"]))
+
+    return (get_rna_exp,)
 
 
 @app.cell
@@ -196,13 +194,13 @@ def _(compute_survival_columns, find_paths, get_rna_exp, pl):
           - Salva o DataFrame final em formato Parquet com compressão snappy e o retorna.
         """
         all_data_frames = []
-    
+
         # Filtra colunas de "survival" e faz join com bio
         df_survival = compute_survival_columns(df_clinical)
 
         lf_bio = df_bio.lazy()
         lf_survival = df_survival.lazy()
-    
+
         df_base = lf_bio.join(
             lf_survival,
             left_on="cases.0.case_id",
@@ -251,7 +249,7 @@ def _(compute_survival_columns, find_paths, get_rna_exp, pl):
 
         final_df = pl.concat(all_data_frames, how="diagonal")
         final_df.write_parquet(output_file, compression="snappy")
-    
+
         return final_df
 
     return
