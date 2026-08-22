@@ -6,13 +6,64 @@
   },
   "cells": [
     {
+      "id": "WBqB",
+      "code_hash": "09ae1f43ac4ad98b55521cd990b70f21",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h1 id=\"filtragem-de-dados\">Filtragem de dados</h1></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
       "id": "Hbol",
+      "code_hash": "8e5057a223746fe1c7a8adee76e7708c",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/plain": ""
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "KYEx",
+      "code_hash": "382c74407bf1bd592fafe7790c2d4bbc",
+      "outputs": [
+        {
+          "type": "data",
+          "data": {
+            "text/markdown": "<span class=\"markdown prose dark:prose-invert contents\"><h2 id=\"pipeline\">Pipeline</h2>\n<ul>\n<li><code>survival_time</code>: dias at\u00e9 a morte (<code>days_to_death</code>) ou at\u00e9 o \u00faltimo contato\n  (<code>days_to_last_follow_up</code>) para pacientes censurados.</li>\n<li><code>event</code>: 1 = \u00f3bito confirmado; 0 = censurado (paciente ainda vivo ou perdido\n  de seguimento).</li>\n</ul></span>"
+          }
+        }
+      ],
+      "console": []
+    },
+    {
+      "id": "MJUe",
       "code_hash": null,
       "outputs": [],
       "console": []
     },
     {
-      "id": "uDjn",
+      "id": "JtaO",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "TMnA",
+      "code_hash": null,
+      "outputs": [],
+      "console": []
+    },
+    {
+      "id": "tlpm",
       "code_hash": null,
       "outputs": [],
       "console": []
