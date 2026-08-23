@@ -190,17 +190,28 @@ def _run_single_split(
     epochs: int,
     lr: float,
     seed: int,
+    fixed_test_idx: np.ndarray = None,
 ) -> dict:
     """
     Executa um split treino/teste + CV interna + treino final para uma única seed.
     Retorna, por arquitetura, as métricas de CV, as métricas de teste e as previsões.
+
+    Se fixed_test_idx for passado, o conjunto de teste é sempre esse (o mesmo
+    split externo único, reaproveitado também na seleção de genes), e apenas
+    a CV interna dentro do treino varia por seed. Isso evita que o "teste"
+    mude a cada seed, o que manteria a comparabilidade com a seleção de genes
+    feita uma única vez fora daqui.
     """
     num_nodes = data.num_nodes
-
     all_idx = np.arange(num_nodes)
-    train_idx, test_idx = train_test_split(
-        all_idx, test_size=test_size, random_state=seed, stratify=data.y.numpy()
-    )
+
+    if fixed_test_idx is not None:
+        test_idx = fixed_test_idx
+        train_idx = np.setdiff1d(all_idx, test_idx)
+    else:
+        train_idx, test_idx = train_test_split(
+            all_idx, test_size=test_size, random_state=seed, stratify=data.y.numpy()
+        )
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     seed_results = {}
@@ -258,6 +269,7 @@ def predict_event_gnn(
     n_splits: int = 5,
     n_repeats: int = 5,
     base_seed: int = 42,
+    test_case_ids: list = None,
 ) -> dict:
     """
     Treina GCN e SGC sobre o grafo de pacientes para prever o evento
@@ -268,11 +280,30 @@ def predict_event_gnn(
     vezes (padrao 5), cada vez com uma seed distinta (base_seed, base_seed+1, ...),
     para medir a variabilidade do resultado alem do ruido de um unico split.
 
+    test_case_ids: se passado (tipicamente os test_ids de
+    lasso_analysis.train_test_case_ids), fixa o conjunto de teste para ser
+    exatamente esses pacientes em TODAS as seeds — o mesmo conjunto de teste
+    usado (e nunca visto) pela seleção de genes. Só a CV interna varia por
+    seed nesse caso; o split externo deixa de ser re-sorteado a cada seed.
+    Se None, mantém o comportamento original (split novo a cada seed).
+
     Retorna, para cada arquitetura, a media e o desvio padrao (entre as n_repeats
     execucoes) de balanced accuracy e AUC, tanto da CV interna quanto do teste final,
     alem das previsoes de cada execucao.
     """
     data, node_ids = _graph_to_pyg_data(G)
+
+    fixed_test_idx = None
+    if test_case_ids is not None:
+        node_index = {node_id: i for i, node_id in enumerate(node_ids)}
+        fixed_test_idx = np.array(
+            [node_index[cid] for cid in test_case_ids if cid in node_index],
+            dtype=np.int64,
+        )
+        missing = set(test_case_ids) - set(node_index.keys())
+        if missing:
+            print(f"[predict_event_gnn] Aviso: {len(missing)} case_ids de teste "
+                  f"não encontrados no grafo (fora de selected_genes/dataset atual, ignorados).")
 
     architectures = {
         "GCN": lambda: GCNClassifier(data.num_node_features, hidden_dim),
@@ -284,7 +315,8 @@ def predict_event_gnn(
 
     for seed in seeds:
         seed_results = _run_single_split(
-            data, node_ids, architectures, test_size, n_splits, epochs, lr, seed
+            data, node_ids, architectures, test_size, n_splits, epochs, lr, seed,
+            fixed_test_idx=fixed_test_idx,
         )
         for name in architectures:
             runs_per_architecture[name].append(seed_results[name])
