@@ -69,7 +69,7 @@ def lasso(target_file):
         pipeline_final,
         param_grid=param_grid,
         cv=cv_splits,
-        n_jobs=10,
+        n_jobs=-1,
         error_score=0.5
     )
 
