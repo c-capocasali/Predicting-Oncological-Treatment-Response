@@ -65,15 +65,24 @@ def _run_single_split_classical(
     test_size: float,
     n_splits: int,
     seed: int,
+    fixed_test_idx: np.ndarray = None,
 ) -> dict:
     """
     Mesma lógica de split (treino/teste + CV interna) usada em
-    _run_single_split (gnn_survival.py), aplicada aos modelos clássicos.
+    _run_single_split (graph.py), aplicada aos modelos clássicos.
+
+    Se fixed_test_idx for passado, o teste é sempre esse (mesmo split externo
+    único usado na seleção de genes e na GNN); só a CV interna varia por seed.
     """
     all_idx = np.arange(len(y))
-    train_idx, test_idx = train_test_split(
-        all_idx, test_size=test_size, random_state=seed, stratify=y
-    )
+
+    if fixed_test_idx is not None:
+        test_idx = fixed_test_idx
+        train_idx = np.setdiff1d(all_idx, test_idx)
+    else:
+        train_idx, test_idx = train_test_split(
+            all_idx, test_size=test_size, random_state=seed, stratify=y
+        )
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     seed_results = {}
@@ -134,6 +143,7 @@ def predict_event_classical(
     n_splits: int = 5,
     n_repeats: int = 5,
     base_seed: int = 42,
+    test_case_ids: list = None,
 ) -> dict:
     """
     Avalia modelos clássicos (KNN para vários K, SVM, MLP, Random Forest) na
@@ -145,16 +155,35 @@ def predict_event_classical(
     A comparação direta com predict_event_gnn serve para avaliar se a
     estrutura do grafo KNN + propagação da GNN agrega sinal em relação aos
     mesmos dados tratados de forma puramente tabular (sem grafo).
+
+    test_case_ids: mesmo papel de predict_event_gnn — fixa o conjunto de
+    teste (tipicamente os test_ids de lasso_analysis.train_test_case_ids)
+    para ser o mesmo em todas as seeds e o mesmo já reservado na seleção de
+    genes, em vez de resortear o split a cada seed.
     """
     X, y, node_ids = _graph_to_arrays(G)
     models = _build_classical_models(k_values)
+
+    fixed_test_idx = None
+    if test_case_ids is not None:
+        node_index = {node_id: i for i, node_id in enumerate(node_ids)}
+        fixed_test_idx = np.array(
+            [node_index[cid] for cid in test_case_ids if cid in node_index],
+            dtype=np.int64,
+        )
+        missing = set(test_case_ids) - set(node_index.keys())
+        if missing:
+            print(f"[predict_event_classical] Aviso: {len(missing)} case_ids de teste "
+                  f"não encontrados no grafo (ignorados).")
 
     seeds = [base_seed + i for i in range(n_repeats)]
     runs_per_model = {name: [] for name in models}
 
     for seed in seeds:
         seed_results = _run_single_split_classical(
-            X, y, node_ids, models, test_size, n_splits, seed)
+            X, y, node_ids, models, test_size, n_splits, seed,
+            fixed_test_idx=fixed_test_idx,
+        )
         for name in models:
             if seed_results[name] is not None:
                 runs_per_model[name].append(seed_results[name])
