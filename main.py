@@ -41,7 +41,9 @@ def _():
 @app.cell
 def _(lasso, target_file):
     #Calculando os genes com o laço 
-    selected_genes, c_index = lasso(target_file)
+    #top_n_variance_genes limita quantos genes entram no Coxnet (evita
+    #estouro de memória com GridSearchCV n_jobs=-1); ajuste se necessário
+    selected_genes, c_index = lasso(target_file, top_n_variance_genes=520)
     print(selected_genes) 
     print("*"*50)
     print(c_index)
