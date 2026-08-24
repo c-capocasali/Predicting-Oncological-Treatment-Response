@@ -7,15 +7,8 @@
   "cells": [
     {
       "id": "Hbol",
-      "code_hash": "a0cc8bee08afa12838e3d4450ffbbc40",
-      "outputs": [
-        {
-          "type": "data",
-          "data": {
-            "text/plain": ""
-          }
-        }
-      ],
+      "code_hash": "641272c54c9f6f3de4fada9f40876897",
+      "outputs": [],
       "console": []
     },
     {
@@ -26,25 +19,25 @@
     },
     {
       "id": "vblA",
-      "code_hash": "d8238fef7c038923a213f6c4b8cf725e",
+      "code_hash": "51d0790f28cb2ffc8630c793e027670c",
       "outputs": [],
       "console": []
     },
     {
       "id": "bkHC",
-      "code_hash": "435b59098f03b82202f1530d32aa0ba5",
+      "code_hash": "8313bfc7e326dba436eb55389235f05f",
       "outputs": [],
       "console": []
     },
     {
-      "id": "onQb",
-      "code_hash": null,
+      "id": "lEQa",
+      "code_hash": "79a11b9ece5ed34bf1e46ef0aa6dc6bd",
       "outputs": [],
       "console": []
     },
     {
-      "id": "nwEO",
-      "code_hash": null,
+      "id": "PKri",
+      "code_hash": "bbcec1f17a619d457f162d2a1bb7a520",
       "outputs": [],
       "console": []
     }
