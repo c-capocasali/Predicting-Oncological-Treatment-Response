@@ -82,45 +82,34 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
 
 
 class GCNClassifier(nn.Module):
-    """
-    GCN de 2 camadas, seguindo EXATAMENTE a estrutura da classe `Net` em
-    gcn(2).py: conv1 -> relu -> dropout -> conv2 -> log_softmax. A segunda
-    GCNConv já produz `num_classes` canais (não há cabeça Linear extra), e o
-    treino usa nll_loss sobre log_softmax (classificação, não logit binário).
-    Assim como no arquivo de referência, edge_weight não é usado — o grafo é
-    tratado como não-ponderado dentro da GNN.
-    """
+    """GCN de 2 camadas + cabeça linear para classificação binária do evento."""
 
-    def __init__(self, in_channels: int, hidden_channels: int, num_classes: int = 2):
+    def __init__(self, in_channels: int, hidden_channels: int):
         super().__init__()
         self.conv1 = GCNConv(in_channels, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, num_classes)
+        self.conv2 = GCNConv(hidden_channels, hidden_channels)
+        self.lin = nn.Linear(hidden_channels, 1)
 
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, training=self.training)
-        x = self.conv2(x, edge_index)
-        return F.log_softmax(x, dim=1)
+    def forward(self, x, edge_index, edge_weight=None):
+        x = F.relu(self.conv1(x, edge_index, edge_weight))
+        x = F.relu(self.conv2(x, edge_index, edge_weight))
+        x = self.lin(x)
+        # logits (sem sigmoid, aplicado depois na loss/avaliacao)
+        return x.squeeze(-1)
 
 
 class SGCClassifier(nn.Module):
-    """
-    SGC seguindo EXATAMENTE a estrutura da classe `SGC` em gcn(2).py: uma
-    única SGConv (propagação simplificada, K saltos) produzindo diretamente
-    `num_classes` canais, sem cabeça Linear e sem não-linearidade extra entre
-    a convolução e a saída — log_softmax aplicado direto sobre a SGConv,
-    preservando a hipótese central da SGC (linearidade entre as camadas de
-    propagação). `cached=True` como no arquivo de referência.
-    """
+    """SGC (propagacao simplificada, K saltos) + cabeca linear para classificacao binaria."""
 
-    def __init__(self, in_channels: int, num_classes: int = 2, K: int = 2):
+    def __init__(self, in_channels: int, hidden_channels: int, K: int = 2):
         super().__init__()
-        self.conv1 = SGConv(in_channels, num_classes, K=K, cached=True)
+        self.conv = SGConv(in_channels, hidden_channels, K=K)
+        self.lin = nn.Linear(hidden_channels, 1)
 
-    def forward(self, x, edge_index):
-        x = self.conv1(x, edge_index)
-        return F.log_softmax(x, dim=1)
+    def forward(self, x, edge_index, edge_weight=None):
+        x = F.relu(self.conv(x, edge_index, edge_weight))
+        x = self.lin(x)
+        return x.squeeze(-1)  # logits
 
 
 def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
@@ -133,9 +122,7 @@ def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
     node_index = {node_id: i for i, node_id in enumerate(node_ids)}
 
     genes = np.array([G.nodes[n]["genes"] for n in node_ids], dtype=np.float32)
-    # long (nao float): classes discretas para F.nll_loss + log_softmax,
-    # seguindo o paradigma de classificacao usado em gcn(2).py
-    event = np.array([G.nodes[n]["event"] for n in node_ids], dtype=np.int64)
+    event = np.array([G.nodes[n]["event"] for n in node_ids], dtype=np.float32)
 
     # Arestas nos dois sentidos, ja que o grafo e nao-direcionado
     edges = list(G.edges(data="weight"))
@@ -149,37 +136,28 @@ def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
         x=torch.tensor(genes, dtype=torch.float32),
         edge_index=torch.tensor([src, dst], dtype=torch.long),
         edge_weight=torch.tensor(weights, dtype=torch.float32),
-        y=torch.tensor(event, dtype=torch.long),
+        y=torch.tensor(event, dtype=torch.float32),
     )
     return data, node_ids
 
 
-def _compute_class_weight(y: torch.Tensor, train_mask: torch.Tensor, num_classes: int = 2) -> torch.Tensor:
-    """
-    Pesos por classe para F.nll_loss (equivalente, em espírito, ao pos_weight
-    usado antes com BCE): compensa o desbalanceamento das classes calculado a
-    partir do conjunto de treino. O arquivo de referência (gcn(2).py) não usa
-    nenhum peso de classe — mantemos essa compensação aqui por ser a mesma
-    escolha de justiça já documentada no restante do pipeline (baselines.py
-    usa class_weight='balanced'), só adaptada de BCE para nll_loss.
-    """
-    y_train = y[train_mask]
-    class_counts = torch.bincount(y_train, minlength=num_classes).float()
-    weight = class_counts.sum() / (num_classes * class_counts.clamp(min=1))
-    return weight
-
-
 def _train_model(model: nn.Module, data: Data, train_mask: torch.Tensor, epochs: int, lr: float) -> nn.Module:
-    # weight_decay=5e-4 e optimizer identicos ao GCNClassifier.predict em gcn(2).py
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
-    class_weight = _compute_class_weight(data.y, train_mask)
+
+    # pos_weight compensa o desbalanceamento das classes na loss: dá mais peso à classe
+    # minoritária (geralmente o evento=1), calculado a partir do próprio conjunto de treino
+    y_train = data.y[train_mask]
+    num_positives = y_train.sum()
+    num_negatives = len(y_train) - num_positives
+    pos_weight = num_negatives / num_positives.clamp(min=1)
 
     model.train()
     for _ in range(epochs):
         optimizer.zero_grad()
-        out = model(data.x, data.edge_index)
-        # nll_loss sobre log_softmax, como em gcn(2).py (F.nll_loss(out[train_mask], y[train_mask]))
-        loss = F.nll_loss(out[train_mask], data.y[train_mask], weight=class_weight)
+        out = model(data.x, data.edge_index, data.edge_weight)
+        loss = F.binary_cross_entropy_with_logits(
+            out[train_mask], data.y[train_mask], pos_weight=pos_weight
+        )
         loss.backward()
         optimizer.step()
     return model
@@ -188,12 +166,10 @@ def _train_model(model: nn.Module, data: Data, train_mask: torch.Tensor, epochs:
 @torch.no_grad()
 def _evaluate(model: nn.Module, data: Data, mask: torch.Tensor) -> tuple[float, float, np.ndarray]:
     model.eval()
-    out = model(data.x, data.edge_index)
-    # out ja e log_softmax; exp() devolve as probabilidades por classe
-    probs_all = torch.exp(out)
-    probs = probs_all[mask][:, 1].numpy()  # probabilidade da classe evento=1
-    preds = probs_all[mask].argmax(dim=1).numpy()
-    targets = data.y[mask].numpy()
+    out = model(data.x, data.edge_index, data.edge_weight)
+    probs = torch.sigmoid(out[mask]).numpy()
+    preds = (probs >= 0.5).astype(int)
+    targets = data.y[mask].numpy().astype(int)
 
     accuracy = balanced_accuracy_score(targets, preds)
     # AUC exige as duas classes presentes na mascara; em folds pequenos isso pode falhar
@@ -209,27 +185,22 @@ def _run_single_split(
     data: Data,
     node_ids: list,
     architectures: dict,
-    train_idx: np.ndarray,
-    test_idx: np.ndarray,
+    test_size: float,
     n_splits: int,
     epochs: int,
     lr: float,
     seed: int,
 ) -> dict:
     """
-    Executa a CV interna + treino final para uma única seed, sobre um split
-    treino/teste FIXO (train_idx/test_idx), o mesmo em todas as repetições.
-
-    Por que o split é fixo entre repetições: a seleção de genes via Lasso
-    (lasso_analysis.py) é feita uma única vez, sobre um único split
-    (random_state=42). Se cada repetição gerasse um split treino/teste novo,
-    pacientes que fizeram parte do treino do Lasso em outras repetições
-    acabariam no conjunto de teste — vazamento de seleção de features. Fixar
-    o split (mesma seed do Lasso) elimina esse vazamento. As seeds diferentes
-    entre repetições continuam variando a CV interna (StratifiedKFold) e a
-    inicialização dos pesos do modelo, preservando uma medida de variância.
+    Executa um split treino/teste + CV interna + treino final para uma única seed.
+    Retorna, por arquitetura, as métricas de CV, as métricas de teste e as previsões.
     """
     num_nodes = data.num_nodes
+
+    all_idx = np.arange(num_nodes)
+    train_idx, test_idx = train_test_split(
+        all_idx, test_size=test_size, random_state=seed, stratify=data.y.numpy()
+    )
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     seed_results = {}
@@ -244,7 +215,6 @@ def _run_single_split(
             train_mask[train_idx[fold_train_idx]] = True
             val_mask[train_idx[fold_val_idx]] = True
 
-            torch.manual_seed(seed)
             model = build_model()
             model = _train_model(model, data, train_mask, epochs, lr)
             fold_acc, fold_auc, _ = _evaluate(model, data, val_mask)
@@ -257,7 +227,6 @@ def _run_single_split(
         train_mask[train_idx] = True
         test_mask[test_idx] = True
 
-        torch.manual_seed(seed)
         final_model = build_model()
         final_model = _train_model(final_model, data, train_mask, epochs, lr)
         test_balanced_accuracy, test_auc, test_probs = _evaluate(
@@ -282,9 +251,9 @@ def _run_single_split(
 
 def predict_event_gnn(
     G: nx.Graph,
-    hidden_dim: int = 32,
+    hidden_dim: int = 64,
     epochs: int = 200,
-    lr: float = 0.0001,
+    lr: float = 0.01,
     test_size: float = 0.2,
     n_splits: int = 5,
     n_repeats: int = 5,
@@ -295,17 +264,9 @@ def predict_event_gnn(
     (0 = vivo/censurado, 1 = obito), evitando o vies de censura que
     afeta a previsao direta do survival_time.
 
-    GCN e SGC seguem EXATAMENTE a estrutura de Net e SGC em gcn(2).py
-    (mesmas camadas/ordem, log_softmax + nll_loss, sem edge_weight).
-    hidden_dim, epochs e lr default tambem replicam pNNeurons=32,
-    pNEpochs=200 e pLR=0.0001 do arquivo de referencia.
-
-    Split treino/teste UNICO e FIXO (seed=base_seed), o mesmo usado pelo
-    Lasso em lasso_analysis.py — evita vazamento da selecao de genes para
-    o teste (ver docstring de _run_single_split). As n_repeats seeds
-    (base_seed, base_seed+1, ...) variam apenas a CV interna (5-fold) e a
-    inicializacao dos pesos do modelo, medindo variabilidade sem gerar
-    novos conjuntos de teste.
+    Repete o split treino/teste (0.2) + CV estratificada interna (5-fold) n_repeats
+    vezes (padrao 5), cada vez com uma seed distinta (base_seed, base_seed+1, ...),
+    para medir a variabilidade do resultado alem do ruido de um unico split.
 
     Retorna, para cada arquitetura, a media e o desvio padrao (entre as n_repeats
     execucoes) de balanced accuracy e AUC, tanto da CV interna quanto do teste final,
@@ -315,21 +276,15 @@ def predict_event_gnn(
 
     architectures = {
         "GCN": lambda: GCNClassifier(data.num_node_features, hidden_dim),
-        "SGC": lambda: SGCClassifier(data.num_node_features),
+        "SGC": lambda: SGCClassifier(data.num_node_features, hidden_dim),
     }
-
-    # Split externo fixo (Opcao B) - calculado uma unica vez, igual ao do Lasso
-    all_idx = np.arange(data.num_nodes)
-    train_idx, test_idx = train_test_split(
-        all_idx, test_size=test_size, random_state=base_seed, stratify=data.y.numpy()
-    )
 
     seeds = [base_seed + i for i in range(n_repeats)]
     runs_per_architecture = {name: [] for name in architectures}
 
     for seed in seeds:
         seed_results = _run_single_split(
-            data, node_ids, architectures, train_idx, test_idx, n_splits, epochs, lr, seed
+            data, node_ids, architectures, test_size, n_splits, epochs, lr, seed
         )
         for name in architectures:
             runs_per_architecture[name].append(seed_results[name])

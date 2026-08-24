@@ -21,31 +21,25 @@ def _graph_to_arrays(G: nx.Graph) -> tuple[np.ndarray, np.ndarray, list]:
     return X, y, node_ids
 
 
-def _build_classical_models(k_values: list[int], seed: int) -> dict:
+def _build_classical_models(k_values: list[int]) -> dict:
     """
     Monta os modelos clássicos a avaliar. Cada K do KNN é tratado como um
     modelo separado (sem busca de hiperparâmetro, conforme pedido).
 
     Observação de justiça na comparação: usamos class_weight='balanced' nos
     modelos que suportam esse parâmetro (SVM, Random Forest), para compensar
-    o desbalanceamento das classes de forma equivalente ao pos_weight/peso
-    de classe usado no treino das GNNs. KNN e MLP não têm suporte nativo a
-    isso no sklearn.
-
-    `seed` (a seed da repetição atual, não mais fixa em 42) alimenta o
-    random_state de SVM/MLP/RandomForest — com o split treino/teste agora
-    fixo entre repetições (ver predict_event_classical), é essa variação de
-    seed que garante que as n_repeats execuções não sejam todas idênticas.
+    o desbalanceamento das classes de forma equivalente ao pos_weight usado
+    no treino das GNNs. KNN e MLP não têm suporte nativo a isso no sklearn.
     """
     models = {
         f"KNN_k{k}": (lambda k=k: KNeighborsClassifier(n_neighbors=k))
         for k in k_values
     }
     models["SVM"] = lambda: SVC(
-        probability=True, class_weight="balanced", random_state=seed)
-    models["MLP"] = lambda: MLPClassifier(max_iter=1000, random_state=seed)
+        probability=True, class_weight="balanced", random_state=42)
+    models["MLP"] = lambda: MLPClassifier(max_iter=1000, random_state=42)
     models["RandomForest"] = lambda: RandomForestClassifier(
-        class_weight="balanced", random_state=seed)
+        class_weight="balanced", random_state=42)
     return models
 
 
@@ -68,16 +62,18 @@ def _run_single_split_classical(
     y: np.ndarray,
     node_ids: list,
     models: dict,
-    train_idx: np.ndarray,
-    test_idx: np.ndarray,
+    test_size: float,
     n_splits: int,
     seed: int,
 ) -> dict:
     """
-    Mesma lógica de CV interna usada em _run_single_split (graph.py), aplicada
-    aos modelos clássicos, sobre um split treino/teste FIXO (train_idx/test_idx,
-    o mesmo em todas as repetições — ver docstring de predict_event_classical).
+    Mesma lógica de split (treino/teste + CV interna) usada em
+    _run_single_split (gnn_survival.py), aplicada aos modelos clássicos.
     """
+    all_idx = np.arange(len(y))
+    train_idx, test_idx = train_test_split(
+        all_idx, test_size=test_size, random_state=seed, stratify=y
+    )
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
 
     seed_results = {}
@@ -149,30 +145,17 @@ def predict_event_classical(
     A comparação direta com predict_event_gnn serve para avaliar se a
     estrutura do grafo KNN + propagação da GNN agrega sinal em relação aos
     mesmos dados tratados de forma puramente tabular (sem grafo).
-
-    Split treino/teste UNICO e FIXO (seed=base_seed), o mesmo usado pelo
-    Lasso (lasso_analysis.py) e por predict_event_gnn — evita que pacientes
-    usados no ajuste do Lasso apareçam no teste de outras repetições
-    (vazamento de seleção de features). As n_repeats seeds variam apenas a
-    CV interna e a inicialização de SVM/MLP/RandomForest.
     """
     X, y, node_ids = _graph_to_arrays(G)
-
-    # Split externo fixo (Opcao B) - calculado uma unica vez, igual ao do Lasso e da GNN
-    all_idx = np.arange(len(y))
-    train_idx, test_idx = train_test_split(
-        all_idx, test_size=test_size, random_state=base_seed, stratify=y
-    )
+    models = _build_classical_models(k_values)
 
     seeds = [base_seed + i for i in range(n_repeats)]
-    runs_per_model = {}
+    runs_per_model = {name: [] for name in models}
 
     for seed in seeds:
-        models = _build_classical_models(k_values, seed)
         seed_results = _run_single_split_classical(
-            X, y, node_ids, models, train_idx, test_idx, n_splits, seed)
+            X, y, node_ids, models, test_size, n_splits, seed)
         for name in models:
-            runs_per_model.setdefault(name, [])
             if seed_results[name] is not None:
                 runs_per_model[name].append(seed_results[name])
 
