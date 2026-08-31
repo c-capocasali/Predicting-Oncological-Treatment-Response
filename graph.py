@@ -12,15 +12,27 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SGConv
 
 
-def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int = 5) -> nx.Graph:
+def compute_rbo(x, y, top_k):
+    p = 0.9
+    score = 0
+
+    for k in range(1, top_k+1):
+        inter = len(set(x[:k]) & set(y[:k]))
+        score += (p**(k-1))*(inter/k)
+
+    score = (1-p)*score
+
+    return score
+
+
+def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int = 5, rbo_top_k: int = 50) -> nx.Graph:
     """
     Constrói um grafo KNN não-direcionado onde cada vértice é um paciente.
+    Topologia definida pela distância euclidiana, pesos definidos pelo RBO.
     """
     # 1. Carregar os dados
     df = pl.read_parquet(target_file)
 
-    # Valida se a coluna 'case_id' existe (usada no seu filter.py),
-    # senão usa o índice da linha como identificador do vértice
     has_case_id = "case_id" in df.columns
     cols_to_select = (["case_id", "survival_time", "event"] if has_case_id else [
                       "survival_time", "event"]) + selected_genes
@@ -29,23 +41,22 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
     # 2. Matriz de features para o KNN (Apenas Genes)
     X_genes = df_filtered.select(selected_genes).to_numpy()
 
-    # 2.1 Tratamento de nulls (paciente sem valor reportado para algum gene)
-    # Imputação pela média do gene, calculada ignorando os NaNs existentes
     if np.isnan(X_genes).any():
         col_means = np.nanmean(X_genes, axis=0)
         nan_idx = np.where(np.isnan(X_genes))
         X_genes[nan_idx] = np.take(col_means, nan_idx[1])
 
-    # 2.2 Normalização: mesma transformação usada na seleção via Lasso (lasso_analysis.py),
-    # para manter o espaço de features consistente entre seleção e distância do grafo
     X_genes = np.log1p(X_genes)
     X_genes = StandardScaler().fit_transform(X_genes)
 
-    # 3. Calcular os K Vizinhos Mais Próximos
-    # Usamos k + 1 porque o algoritmo considera o próprio ponto como o vizinho mais próximo (distância 0)
+    # 3. Calcular os K Vizinhos Mais Próximos (Topologia Euclidiana original)
     nn = NearestNeighbors(n_neighbors=k + 1, metric='euclidean', n_jobs=-1)
     nn.fit(X_genes)
     distances, indices = nn.kneighbors(X_genes)
+
+    # 3.1 Pré-computar os rankings das features para o RBO (do maior valor para o menor)
+    ranked_features = np.argsort(-X_genes, axis=1).tolist()
+    actual_rbo_top_k = min(rbo_top_k, X_genes.shape[1])
 
     # 4. Construir o Grafo
     G = nx.Graph()
@@ -55,10 +66,6 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
     # 4.1 Adicionar os Vértices (Nós) com seus Embeddings
     for i, row in enumerate(df_filtered.iter_rows(named=True)):
         node_id = node_ids[i]
-
-        # Salvamos as features já tratadas (imputadas e normalizadas) para facilitar a
-        # conversão futura para PyTorch Geometric (Data.x e Data.y), evitando reprocessar
-        # nulls/normalização em outro lugar do pipeline
         G.add_node(
             node_id,
             genes=X_genes[i].tolist(),
@@ -66,19 +73,25 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
             event=row["event"]
         )
 
-    # 4.2 Adicionar as Arestas
+    # 4.2 Adicionar as Arestas com Pesos RBO
     for i, neighbors in enumerate(indices):
         source_patient = node_ids[i]
 
-        # Começamos do range(1, ...) para ignorar o vizinho 0 (que é o próprio paciente)
         for j in range(1, k + 1):
             target_patient = node_ids[neighbors[j]]
-            edge_weight = distances[i][j]
 
-            # No networkx, se A liga em B, e B liga em A, a aresta não é duplicada (grafo não-direcionado)
+            # Substituímos a distância (distances[i][j]) pelo score RBO
+            edge_weight = compute_rbo(
+                ranked_features[i],
+                ranked_features[neighbors[j]],
+                actual_rbo_top_k
+            )
+
             G.add_edge(source_patient, target_patient, weight=edge_weight)
 
     return G
+
+# ... (restante do código igual) ...
 
 
 class GCNClassifier(nn.Module):
