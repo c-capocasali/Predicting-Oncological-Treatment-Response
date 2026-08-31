@@ -39,7 +39,7 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
     # 2.2 Normalização: mesma transformação usada na seleção via Lasso (lasso_analysis.py),
     # para manter o espaço de features consistente entre seleção e distância do grafo
     X_genes = np.log1p(X_genes)
-    X_genes = StandardScaler().fit_transform(X_genes)
+    # X_genes = StandardScaler().fit_transform(X_genes)
 
     # 3. Calcular os K Vizinhos Mais Próximos
     # Usamos k + 1 porque o algoritmo considera o próprio ponto como o vizinho mais próximo (distância 0)
@@ -66,16 +66,19 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
             event=row["event"]
         )
 
-    # 4.2 Adicionar as Arestas
+# 4.2 Adicionar as Arestas
     for i, neighbors in enumerate(indices):
         source_patient = node_ids[i]
 
         # Começamos do range(1, ...) para ignorar o vizinho 0 (que é o próprio paciente)
         for j in range(1, k + 1):
             target_patient = node_ids[neighbors[j]]
-            edge_weight = distances[i][j]
 
-            # No networkx, se A liga em B, e B liga em A, a aresta não é duplicada (grafo não-direcionado)
+            # Modificação: Transformando a distância Euclidiana em Similaridade
+            raw_distance = distances[i][j]
+            edge_weight = 1.0 / (1.0 + raw_distance)
+
+            # No networkx, se A liga em B, e B liga em A, a aresta não é duplicada
             G.add_edge(source_patient, target_patient, weight=edge_weight)
 
     return G
@@ -191,10 +194,7 @@ def _run_single_split(
     lr: float,
     seed: int,
 ) -> dict:
-    """
-    Executa um split treino/teste + CV interna + treino final para uma única seed.
-    Retorna, por arquitetura, as métricas de CV, as métricas de teste e as previsões.
-    """
+
     num_nodes = data.num_nodes
 
     all_idx = np.arange(num_nodes)
@@ -215,9 +215,18 @@ def _run_single_split(
             train_mask[train_idx[fold_train_idx]] = True
             val_mask[train_idx[fold_val_idx]] = True
 
+            # Normalização isolada no fold
+            fold_data = data.clone()
+            scaler = StandardScaler()
+            train_nodes = train_idx[fold_train_idx]
+            scaler.fit(fold_data.x[train_nodes].numpy())
+            fold_data.x = torch.tensor(scaler.transform(
+                fold_data.x.numpy()), dtype=torch.float32)
+
             model = build_model()
-            model = _train_model(model, data, train_mask, epochs, lr)
-            fold_acc, fold_auc, _ = _evaluate(model, data, val_mask)
+            # Substitua 'data' por 'fold_data'
+            model = _train_model(model, fold_data, train_mask, epochs, lr)
+            fold_acc, fold_auc, _ = _evaluate(model, fold_data, val_mask)
             fold_balanced_accuracies.append(fold_acc)
             fold_aucs.append(fold_auc)
 
@@ -227,10 +236,19 @@ def _run_single_split(
         train_mask[train_idx] = True
         test_mask[test_idx] = True
 
+        # Normalização isolada pro modelo final
+        final_data = data.clone()
+        scaler = StandardScaler()
+        scaler.fit(final_data.x[train_idx].numpy())
+        final_data.x = torch.tensor(scaler.transform(
+            final_data.x.numpy()), dtype=torch.float32)
+
         final_model = build_model()
-        final_model = _train_model(final_model, data, train_mask, epochs, lr)
+        # Substitua 'data' por 'final_data'
+        final_model = _train_model(
+            final_model, final_data, train_mask, epochs, lr)
         test_balanced_accuracy, test_auc, test_probs = _evaluate(
-            final_model, data, test_mask)
+            final_model, final_data, test_mask)
 
         seed_results[name] = {
             "cv_balanced_accuracy": float(np.mean(fold_balanced_accuracies)),

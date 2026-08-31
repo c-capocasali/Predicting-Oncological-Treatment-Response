@@ -6,6 +6,8 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
 from sklearn.neural_network import MLPClassifier
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 def _graph_to_arrays(G: nx.Graph) -> tuple[np.ndarray, np.ndarray, list]:
@@ -23,23 +25,23 @@ def _graph_to_arrays(G: nx.Graph) -> tuple[np.ndarray, np.ndarray, list]:
 
 def _build_classical_models(k_values: list[int]) -> dict:
     """
-    Monta os modelos clássicos a avaliar. Cada K do KNN é tratado como um
-    modelo separado (sem busca de hiperparâmetro, conforme pedido).
-
-    Observação de justiça na comparação: usamos class_weight='balanced' nos
-    modelos que suportam esse parâmetro (SVM, Random Forest), para compensar
-    o desbalanceamento das classes de forma equivalente ao pos_weight usado
-    no treino das GNNs. KNN e MLP não têm suporte nativo a isso no sklearn.
+    Monta os modelos clássicos a avaliar. Adicionamos o StandardScaler via 
+    make_pipeline para evitar data leakage durante o K-Fold e o Train/Test split.
     """
     models = {
-        f"KNN_k{k}": (lambda k=k: KNeighborsClassifier(n_neighbors=k))
+        f"KNN_k{k}": (lambda k=k: make_pipeline(StandardScaler(), KNeighborsClassifier(n_neighbors=k)))
         for k in k_values
     }
-    models["SVM"] = lambda: SVC(
-        probability=True, class_weight="balanced", random_state=42)
-    models["MLP"] = lambda: MLPClassifier(max_iter=1000, random_state=42)
-    models["RandomForest"] = lambda: RandomForestClassifier(
-        class_weight="balanced", random_state=42)
+    models["SVM"] = lambda: make_pipeline(
+        StandardScaler(), SVC(probability=True, class_weight="balanced", random_state=42)
+    )
+    models["MLP"] = lambda: make_pipeline(
+        StandardScaler(), MLPClassifier(max_iter=1000, random_state=42)
+    )
+    models["RandomForest"] = lambda: make_pipeline(
+        StandardScaler(), RandomForestClassifier(
+            class_weight="balanced", random_state=42)
+    )
     return models
 
 
