@@ -7,6 +7,8 @@ from sklearn.feature_selection import VarianceThreshold
 from sklearn.model_selection import train_test_split, GridSearchCV
 from sksurv.linear_model import CoxnetSurvivalAnalysis
 from sklearn.model_selection import StratifiedKFold
+import matplotlib.pyplot as plt                      # <-- NOVO
+from sksurv.metrics import concordance_index_censored  # <-- NOVO
 
 
 def lasso(target_file):
@@ -92,5 +94,43 @@ def lasso(target_file):
 
     print(f"\nTotal de genes sobreviventes ao Lasso: {
           len(genes_selecionados)}")
+
+    # ========== INÍCIO DO BLOCO PARA PLOTAGEM ==========
+    # Reutiliza o pipeline_batedor já ajustado para obter o caminho completo
+    cox_batedor = pipeline_batedor.named_steps['cox_lasso']
+    alphas = cox_batedor.alphas_
+    coefs = cox_batedor.coef_          # shape (n_alphas, n_features)
+
+    scaler = pipeline_batedor.named_steps['scaler']
+    X_test_scaled = scaler.transform(X_test_var)
+
+    n_genes_list = []
+    c_index_list = []
+
+    for i in range(len(alphas)):
+        coef = coefs[i]
+        n_genes = np.sum(coef != 0)
+        risk = X_test_scaled.dot(coef)   # escore de risco (quanto maior, pior)
+        c_idx = concordance_index_censored(
+            y_test['Status'], y_test['Survival_in_days'], risk)
+        n_genes_list.append(n_genes)
+        c_index_list.append(c_idx)
+
+    # Marca a posição do melhor alpha (escolhido pelo GridSearchCV)
+    best_idx = np.argmin(np.abs(alphas - melhor_alpha))  # índice mais próximo
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(n_genes_list, c_index_list, marker='o',
+             linestyle='-', color='blue', label='Todos os alphas')
+    plt.plot(n_genes_list[best_idx], c_index_list[best_idx],
+             'r*', markersize=12, label='Melhor alpha (CV)')
+    plt.xlabel('Número de genes selecionados')
+    plt.ylabel('C-index (teste)')
+    plt.title('Desempenho do Lasso-Cox em função do número de genes')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    # ========== FIM DO BLOCO PARA PLOTAGEM ==========
 
     return genes_selecionados, c_index_teste
