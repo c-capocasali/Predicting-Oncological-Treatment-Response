@@ -10,7 +10,8 @@ def _():
     import filter as f
     import polars as pl
     from lasso_analysis import lasso
-    from graph import build_patient_knn_graph, predict_event_gnn, predict_event_classical
+    from graph import build_patient_knn_graph, predict_event_gnn
+    from baselines import predict_event_classical
 
     return (
         build_patient_knn_graph,
