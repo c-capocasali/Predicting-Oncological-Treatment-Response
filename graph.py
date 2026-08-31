@@ -254,23 +254,14 @@ def predict_event_gnn(
     hidden_dim: int = 64,
     epochs: int = 200,
     lr: float = 0.01,
-    test_size: float = 0.2,
+    # Modificado para receber a lista de splits
+    test_sizes: list[float] = [0.8, 0.6, 0.4, 0.2],
     n_splits: int = 5,
     n_repeats: int = 5,
     base_seed: int = 42,
 ) -> dict:
     """
-    Treina GCN e SGC sobre o grafo de pacientes para prever o evento
-    (0 = vivo/censurado, 1 = obito), evitando o vies de censura que
-    afeta a previsao direta do survival_time.
-
-    Repete o split treino/teste (0.2) + CV estratificada interna (5-fold) n_repeats
-    vezes (padrao 5), cada vez com uma seed distinta (base_seed, base_seed+1, ...),
-    para medir a variabilidade do resultado alem do ruido de um unico split.
-
-    Retorna, para cada arquitetura, a media e o desvio padrao (entre as n_repeats
-    execucoes) de balanced accuracy e AUC, tanto da CV interna quanto do teste final,
-    alem das previsoes de cada execucao.
+    Treina GCN e SGC sobre o grafo de pacientes em múltiplos splits de treino/teste.
     """
     data, node_ids = _graph_to_pyg_data(G)
 
@@ -280,44 +271,58 @@ def predict_event_gnn(
     }
 
     seeds = [base_seed + i for i in range(n_repeats)]
-    runs_per_architecture = {name: [] for name in architectures}
 
-    for seed in seeds:
-        seed_results = _run_single_split(
-            data, node_ids, architectures, test_size, n_splits, epochs, lr, seed
-        )
-        for name in architectures:
-            runs_per_architecture[name].append(seed_results[name])
+    all_splits_summary = {}  # Dicionário para armazenar os resultados de todos os splits
 
-    summary = {}
-    for name, runs in runs_per_architecture.items():
-        cv_balanced_accuracies = [r["cv_balanced_accuracy"] for r in runs]
-        cv_aucs = [r["cv_auc"] for r in runs]
-        test_balanced_accuracies = [r["test_balanced_accuracy"] for r in runs]
-        test_aucs = [r["test_auc"] for r in runs]
+    for test_size in test_sizes:
+        train_pct = int(round((1 - test_size) * 100))
+        test_pct = int(round(test_size * 100))
 
-        summary[name] = {
-            "cv_balanced_accuracy_mean": float(np.mean(cv_balanced_accuracies)),
-            "cv_balanced_accuracy_std": float(np.std(cv_balanced_accuracies)),
-            "cv_auc_mean": float(np.nanmean(cv_aucs)),
-            "cv_auc_std": float(np.nanstd(cv_aucs)),
-            "test_balanced_accuracy_mean": float(np.mean(test_balanced_accuracies)),
-            "test_balanced_accuracy_std": float(np.std(test_balanced_accuracies)),
-            "test_auc_mean": float(np.mean(test_aucs)),
-            "test_auc_std": float(np.std(test_aucs)),
-            "predictions_per_seed": {
-                seed: r["predictions"] for seed, r in zip(seeds, runs)
-            },
-        }
+        print(f"\n{'='*50}")
+        print(f"AVALIANDO SPLIT: Treino {train_pct}% / Teste {test_pct}%")
+        print(f"{'='*50}")
 
-        print(f"\n[{name}] CV Balanced Accuracy: {summary[name]['cv_balanced_accuracy_mean']:.4f} "
-              f"(+/- {summary[name]['cv_balanced_accuracy_std']:.4f})")
-        print(f"[{name}] CV AUC: {summary[name]['cv_auc_mean']:.4f} "
-              f"(+/- {summary[name]['cv_auc_std']:.4f})")
-        print(f"[{name}] Teste ({n_repeats} seeds) - Balanced Accuracy: "
-              f"{summary[name]['test_balanced_accuracy_mean']:.4f} "
-              f"(+/- {summary[name]['test_balanced_accuracy_std']:.4f}) | "
-              f"AUC: {summary[name]['test_auc_mean']:.4f} "
-              f"(+/- {summary[name]['test_auc_std']:.4f})")
+        runs_per_architecture = {name: [] for name in architectures}
 
-    return summary
+        for seed in seeds:
+            seed_results = _run_single_split(
+                data, node_ids, architectures, test_size, n_splits, epochs, lr, seed
+            )
+            for name in architectures:
+                runs_per_architecture[name].append(seed_results[name])
+
+        summary = {}
+        for name, runs in runs_per_architecture.items():
+            cv_balanced_accuracies = [r["cv_balanced_accuracy"] for r in runs]
+            cv_aucs = [r["cv_auc"] for r in runs]
+            test_balanced_accuracies = [
+                r["test_balanced_accuracy"] for r in runs]
+            test_aucs = [r["test_auc"] for r in runs]
+
+            summary[name] = {
+                "cv_balanced_accuracy_mean": float(np.mean(cv_balanced_accuracies)),
+                "cv_balanced_accuracy_std": float(np.std(cv_balanced_accuracies)),
+                "cv_auc_mean": float(np.nanmean(cv_aucs)),
+                "cv_auc_std": float(np.nanstd(cv_aucs)),
+                "test_balanced_accuracy_mean": float(np.mean(test_balanced_accuracies)),
+                "test_balanced_accuracy_std": float(np.std(test_balanced_accuracies)),
+                "test_auc_mean": float(np.mean(test_aucs)),
+                "test_auc_std": float(np.std(test_aucs)),
+                "predictions_per_seed": {
+                    seed: r["predictions"] for seed, r in zip(seeds, runs)
+                },
+            }
+
+            print(f"\n[{name}] CV Balanced Accuracy: {summary[name]['cv_balanced_accuracy_mean']:.4f} "
+                  f"(+/- {summary[name]['cv_balanced_accuracy_std']:.4f})")
+            print(f"[{name}] CV AUC: {summary[name]['cv_auc_mean']:.4f} "
+                  f"(+/- {summary[name]['cv_auc_std']:.4f})")
+            print(f"[{name}] Teste ({n_repeats} seeds) - Balanced Accuracy: "
+                  f"{summary[name]['test_balanced_accuracy_mean']:.4f} "
+                  f"(+/- {summary[name]['test_balanced_accuracy_std']:.4f}) | "
+                  f"AUC: {summary[name]['test_auc_mean']:.4f} "
+                  f"(+/- {summary[name]['test_auc_std']:.4f})")
+
+        all_splits_summary[f"train_{train_pct}"] = summary
+
+    return all_splits_summary
