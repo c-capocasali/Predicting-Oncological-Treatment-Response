@@ -89,7 +89,7 @@ def lasso(target_file):
         pipeline_final,
         param_grid=param_grid,
         cv=cv_splits,
-        n_jobs=2,
+        n_jobs=-1,
         error_score=0.5
     )
 
@@ -123,7 +123,7 @@ def lasso(target_file):
     c_index_list = []
 
     for i in range(len(alphas)):
-        coef = coefs[i]
+        coef = coefs[:,i]
         n_genes = np.sum(coef != 0)
         risk = X_test_scaled.dot(coef)
 
@@ -138,11 +138,11 @@ def lasso(target_file):
 
     plt.figure(figsize=(10, 6))
     plt.plot(n_genes_list, c_index_list, marker='o',
-             linestyle='-', color='blue', label='Todos os alphas')
+             linestyle='-', color='blue', label='C-index')
     plt.plot(n_genes_list[best_idx], c_index_list[best_idx],
-             'r*', markersize=12, label='Melhor alpha (CV)')
+             'go', markersize=12, label='Melhor métrica')
     plt.xlabel('Número de genes selecionados')
-    plt.ylabel('C-index (teste)')
+    plt.ylabel('C-index')
     plt.title('Desempenho do Lasso-Cox em função do número de genes')
     plt.grid(True)
     plt.legend()
