@@ -4,6 +4,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+import argparse
+import csv
+from pathlib import Path
+
+import numpy as np
+import polars as pl
+import scipy.sparse as sparse
+import scipy.stats as stats
 
 
 METADATA_COLUMNS = {"case_id", "project", "survival_time", "event"}
@@ -355,8 +363,7 @@ def print_summary(rows: list[dict]) -> None:
                 low, high = confidence_interval(difference)
                 print(
                     f"{candidate} - {baseline} em {label}: "
-                    f"{difference.mean()
-                                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
+                    f"{difference.mean()                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
                     f"vitorias {int((difference > 0).sum())}/{len(difference)}"
                 )
 
