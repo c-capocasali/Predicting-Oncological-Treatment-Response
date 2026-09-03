@@ -12,15 +12,14 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SGConv
 
 
-def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int = 5) -> nx.Graph:
+def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int = 5, mode: str = "standard") -> nx.Graph:
     """
-    Constrói um grafo KNN não-direcionado onde cada vértice é um paciente.
+    Constrói um grafo KNN para os pacientes.
+    Modos suportados: 'standard', 'reciprocal', 'inverted'.
     """
     # 1. Carregar os dados
     df = pl.read_parquet(target_file)
 
-    # Valida se a coluna 'case_id' existe (usada no seu filter.py),
-    # senão usa o índice da linha como identificador do vértice
     has_case_id = "case_id" in df.columns
     cols_to_select = (["case_id", "survival_time", "event"] if has_case_id else [
                       "survival_time", "event"]) + selected_genes
@@ -29,36 +28,30 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
     # 2. Matriz de features para o KNN (Apenas Genes)
     X_genes = df_filtered.select(selected_genes).to_numpy()
 
-    # 2.1 Tratamento de nulls (paciente sem valor reportado para algum gene)
-    # Imputação pela média do gene, calculada ignorando os NaNs existentes
+    # 2.1 Tratamento de nulls
     if np.isnan(X_genes).any():
         col_means = np.nanmean(X_genes, axis=0)
         nan_idx = np.where(np.isnan(X_genes))
         X_genes[nan_idx] = np.take(col_means, nan_idx[1])
 
-    # 2.2 Normalização: mesma transformação usada na seleção via Lasso (lasso_analysis.py),
-    # para manter o espaço de features consistente entre seleção e distância do grafo
+    # 2.2 Normalização
     X_genes = np.log1p(X_genes)
-    # X_genes = StandardScaler().fit_transform(X_genes)
 
     # 3. Calcular os K Vizinhos Mais Próximos
-    # Usamos k + 1 porque o algoritmo considera o próprio ponto como o vizinho mais próximo (distância 0)
     nn = NearestNeighbors(n_neighbors=k + 1, metric='euclidean', n_jobs=-1)
     nn.fit(X_genes)
     distances, indices = nn.kneighbors(X_genes)
 
     # 4. Construir o Grafo
-    G = nx.Graph()
+    # Modificação: Se for 'inverted', precisamos de um grafo estritamente direcionado
+    G = nx.DiGraph() if mode == "inverted" else nx.Graph()
+
     node_ids = df_filtered["case_id"].to_list(
     ) if has_case_id else list(range(len(df_filtered)))
 
-    # 4.1 Adicionar os Vértices (Nós) com seus Embeddings
+    # 4.1 Adicionar os Vértices
     for i, row in enumerate(df_filtered.iter_rows(named=True)):
         node_id = node_ids[i]
-
-        # Salvamos as features já tratadas (imputadas e normalizadas) para facilitar a
-        # conversão futura para PyTorch Geometric (Data.x e Data.y), evitando reprocessar
-        # nulls/normalização em outro lugar do pipeline
         G.add_node(
             node_id,
             genes=X_genes[i].tolist(),
@@ -66,20 +59,31 @@ def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int 
             event=row["event"]
         )
 
-# 4.2 Adicionar as Arestas
+    # 4.2 Adicionar as Arestas com Lógica de Experimentos
     for i, neighbors in enumerate(indices):
         source_patient = node_ids[i]
 
-        # Começamos do range(1, ...) para ignorar o vizinho 0 (que é o próprio paciente)
         for j in range(1, k + 1):
-            target_patient = node_ids[neighbors[j]]
+            target_idx = neighbors[j]
+            target_patient = node_ids[target_idx]
 
-            # Modificação: Transformando a distância Euclidiana em Similaridade
             raw_distance = distances[i][j]
             edge_weight = 1.0 / (1.0 + raw_distance)
 
-            # No networkx, se A liga em B, e B liga em A, a aresta não é duplicada
-            G.add_edge(source_patient, target_patient, weight=edge_weight)
+            # Aplicação dos modos de grafo
+            if mode == "reciprocal":
+                # KNN recíproco: só adiciona se 'i' também estiver nos K vizinhos de 'target_idx'
+                if i in indices[target_idx, 1:]:
+                    G.add_edge(source_patient, target_patient,
+                               weight=edge_weight)
+
+            elif mode == "inverted":
+                # Inversão: aresta aponta do vizinho para o paciente fonte
+                G.add_edge(target_patient, source_patient, weight=edge_weight)
+
+            else:
+                # Padrão (Standard)
+                G.add_edge(source_patient, target_patient, weight=edge_weight)
 
     return G
 
@@ -117,9 +121,7 @@ class SGCClassifier(nn.Module):
 
 def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
     """
-    Converte o grafo networkx (nos com atributos 'genes' e 'event') em um
-    objeto Data do PyTorch Geometric. 'genes' ja chega tratado (nulls
-    imputados, log1p + StandardScaler) desde build_patient_knn_graph.
+    Converte o grafo networkx em um objeto Data do PyTorch Geometric.
     """
     node_ids = list(G.nodes())
     node_index = {node_id: i for i, node_id in enumerate(node_ids)}
@@ -127,13 +129,20 @@ def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
     genes = np.array([G.nodes[n]["genes"] for n in node_ids], dtype=np.float32)
     event = np.array([G.nodes[n]["event"] for n in node_ids], dtype=np.float32)
 
-    # Arestas nos dois sentidos, ja que o grafo e nao-direcionado
     edges = list(G.edges(data="weight"))
-    src = [node_index[u] for u, v, w in edges] + [node_index[v]
-                                                  for u, v, w in edges]
-    dst = [node_index[v] for u, v, w in edges] + [node_index[u]
-                                                  for u, v, w in edges]
-    weights = [w for u, v, w in edges] * 2
+
+    # Modificação: Respeitar o direcionamento se for um nx.DiGraph (Inverted KNN)
+    if isinstance(G, nx.DiGraph):
+        src = [node_index[u] for u, v, w in edges]
+        dst = [node_index[v] for u, v, w in edges]
+        weights = [w for u, v, w in edges]
+    else:
+        # Grafo não-direcionado (Standard e Reciprocal): Espelha as arestas
+        src = [node_index[u] for u, v, w in edges] + [node_index[v]
+                                                      for u, v, w in edges]
+        dst = [node_index[v] for u, v, w in edges] + [node_index[u]
+                                                      for u, v, w in edges]
+        weights = [w for u, v, w in edges] * 2
 
     data = Data(
         x=torch.tensor(genes, dtype=torch.float32),
