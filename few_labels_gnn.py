@@ -5,6 +5,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 import argparse
+import matplotlib.pyplot as plt
 import csv
 from pathlib import Path
 
@@ -225,6 +226,9 @@ def run(args: argparse.Namespace) -> list[dict]:
     all_indices = np.arange(len(labels))
     rows: list[dict] = []
 
+    # Acc de variâncias
+    all_variances = []
+
     print(
         f"Coorte: {len(labels)} pacientes; {int(labels.sum())} positivos; "
         f"{len(labels) - int(labels.sum())} negativos"
@@ -243,6 +247,11 @@ def run(args: argparse.Namespace) -> list[dict]:
             stratify=labels,
             random_state=seed,
         )
+
+        # Captura a variância ordenada desta seed
+        seed_vars = np.var(expression[labelled], axis=0, dtype=np.float64)
+        all_variances.append(np.sort(seed_vars)[::-1])
+
         features = select_and_scale(expression, labelled, args.genes)
 
         # O grafo e transdutivo: atributos de todos os pacientes definem a
@@ -320,6 +329,19 @@ def run(args: argparse.Namespace) -> list[dict]:
                 for name in MODEL_ORDER
             )
         )
+    mean_variances = np.mean(all_variances, axis=0)
+    plt.figure(figsize=(10, 6))
+    plt.plot(mean_variances, label='Variância Média')
+    plt.axvline(x=args.genes, color='red', linestyle='--',
+                label=f'Corte: Top {args.genes}')
+    plt.title(f"Variância Média dos Genes ({len(seeds)} seeds)")
+    plt.xlabel("Genes (Ordenados por Variância Decrescente)")
+    plt.ylabel("Variância Média")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig("variancia_media_genes.png", dpi=300, bbox_inches='tight')
+    plt.close()
+
     return rows
 
 
@@ -363,7 +385,8 @@ def print_summary(rows: list[dict]) -> None:
                 low, high = confidence_interval(difference)
                 print(
                     f"{candidate} - {baseline} em {label}: "
-                    f"{difference.mean()                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
+                    f"{difference.mean()
+                                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
                     f"vitorias {int((difference > 0).sum())}/{len(difference)}"
                 )
 

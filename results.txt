@@ -103,7 +103,6 @@ AVALIANDO SPLIT: Treino 80% / Teste 20%
 
 #KNN Standard 
 
-
 ==================================================
 AVALIANDO SPLIT: Treino 20% / Teste 80%
 ==================================================
@@ -208,3 +207,24 @@ AVALIANDO SPLIT: Treino 80% / Teste 20%
 [SGC] CV Balanced Accuracy: 0.6639 (+/- 0.0067)
 [SGC] CV AUC: 0.7172 (+/- 0.0068)
 [SGC] Teste (5 seeds) - Balanced Accuracy: 0.6734 (+/- 0.0255) | AUC: 0.7318 (+/- 0.0308)
+
+
+
+#Resumo (5% de teste -- 95% de treino) 
+
+k = 3
+Resumo (media +/- desvio-padrao amostral)
+APPNP-linear      | BA 0.6385 +/- 0.0286 | AUC 0.6802 +/- 0.0294
+SGC-linear        | BA 0.6371 +/- 0.0281 | AUC 0.6787 +/- 0.0301
+Linear-sem-grafo  | BA 0.6291 +/- 0.0262 | AUC 0.6727 +/- 0.0309
+RBF-SVM           | BA 0.6319 +/- 0.0255 | AUC 0.6757 +/- 0.0272
+
+k = 80
+Resumo (media +/- desvio-padrao amostral)
+APPNP-linear      | BA 0.6423 +/- 0.0230 | AUC 0.6761 +/- 0.0231
+SGC-linear        | BA 0.6383 +/- 0.0241 | AUC 0.6717 +/- 0.0246
+Linear-sem-grafo  | BA 0.6291 +/- 0.0262 | AUC 0.6727 +/- 0.0309
+RBF-SVM           | BA 0.6319 +/- 0.0255 | AUC 0.6757 +/- 0.0272
+
+
+
