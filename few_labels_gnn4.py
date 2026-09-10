@@ -250,7 +250,14 @@ def evaluate(
     test: np.ndarray,
 ) -> tuple[float, float]:
     prediction = model.predict(features[test])
-    score = model.decision_function(features[test])
+
+    # Verifica qual método o modelo suporta para extrair as pontuações do AUC
+    if hasattr(model, "decision_function"):
+        score = model.decision_function(features[test])
+    else:
+        # Pega a probabilidade da classe positiva (índice 1)
+        score = model.predict_proba(features[test])[:, 1]
+
     return (
         float(balanced_accuracy_score(labels[test], prediction)),
         float(roc_auc_score(labels[test], score)),
@@ -445,8 +452,7 @@ def print_summary(rows: list[dict]) -> None:
                 low, high = confidence_interval(difference)
                 print(
                     f"{candidate} - {baseline} em {label}: "
-                    f"{difference.mean()
-                                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
+                    f"{difference.mean()                       :+.4f}; IC95% [{low:+.4f}, {high:+.4f}]; "
                     f"vitorias {int((difference > 0).sum())}/{len(difference)}"
                 )
 
