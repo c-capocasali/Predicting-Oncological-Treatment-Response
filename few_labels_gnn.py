@@ -4,6 +4,9 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
 import argparse
 import matplotlib.pyplot as plt
 import csv
@@ -16,7 +19,8 @@ import scipy.stats as stats
 
 
 METADATA_COLUMNS = {"case_id", "project", "survival_time", "event"}
-MODEL_ORDER = ("APPNP-linear", "SGC-linear", "Linear-sem-grafo", "RBF-SVM")
+MODEL_ORDER = ("APPNP-linear", "SGC-linear", "Linear-sem-grafo",
+               "RBF-SVM", "KNN", "Random-Forest", "MLP")
 
 
 def parse_seeds(value: str) -> list[int]:
@@ -269,9 +273,8 @@ def run(args: argparse.Namespace) -> list[dict]:
             hops=args.sgc_hops,
         )
 
-        # CORRECAO 3: os quatro modelos partem exatamente do mesmo split e dos
-        # mesmos 400 genes. ``Linear-sem-grafo`` e a ablacao A=I, necessaria
-        # para separar o efeito do grafo do efeito da cabeca linear.
+        # CORRECAO 3: os modelos partem exatamente do mesmo split e dos
+        # mesmos genes. ``Linear-sem-grafo`` e a ablacao A=I.
         models_and_features = {
             "APPNP-linear": (
                 linear_head(seed).fit(
@@ -299,6 +302,24 @@ def run(args: argparse.Namespace) -> list[dict]:
                     cache_size=2000,
                     random_state=seed,
                 ).fit(features[labelled], labels[labelled]),
+                features,
+            ),
+            "KNN": (
+                KNeighborsClassifier(n_neighbors=args.graph_k, metric="cosine").fit(
+                    features[labelled], labels[labelled]
+                ),
+                features,
+            ),
+            "Random-Forest": (
+                RandomForestClassifier(
+                    class_weight="balanced", random_state=seed
+                ).fit(features[labelled], labels[labelled]),
+                features,
+            ),
+            "MLP": (
+                MLPClassifier(random_state=seed, max_iter=2000).fit(
+                    features[labelled], labels[labelled]
+                ),
                 features,
             ),
         }
@@ -329,6 +350,7 @@ def run(args: argparse.Namespace) -> list[dict]:
                 for name in MODEL_ORDER
             )
         )
+
     mean_variances = np.mean(all_variances, axis=0)
     plt.figure(figsize=(10, 6))
     plt.plot(mean_variances, label='Variância Média')
@@ -339,7 +361,8 @@ def run(args: argparse.Namespace) -> list[dict]:
     plt.ylabel("Variância Média")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.savefig("variancia_media_genes.png", dpi=300, bbox_inches='tight')
+    plt.savefig("variancia_media_genes.pdf", format="pdf",
+                dpi=300, bbox_inches='tight')
     plt.close()
 
     return rows
