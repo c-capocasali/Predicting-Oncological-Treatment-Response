@@ -1,88 +1,131 @@
-import polars as pl
-import numpy as np
+"""Grafo de pacientes e redes neurais de grafos (GNNs).
+
+O módulo cobre duas etapas do pipeline:
+
+1. **Construção do grafo** (:func:`build_patient_knn_graph`): cada paciente é
+   um vértice e as arestas ligam cada paciente aos seus ``k`` vizinhos mais
+   próximos no espaço de expressão gênica;
+2. **Classificação do desfecho** (:func:`predict_event_gnn`): treina GCN e
+   SGC sobre esse grafo para prever ``event`` (0 = sem óbito registrado,
+   1 = óbito), com validação cruzada interna e repetição em várias seeds.
+
+Pré-processamento aplicado às features antes do k-NN: imputação pela média
+do gene, ``log1p`` e padronização (``StandardScaler``). O mesmo vetor de
+features é reaproveitado como ``Data.x`` das GNNs.
+
+Ressalva importante sobre os pesos: nesta versão, o atributo ``weight`` de
+cada aresta é a **distância euclidiana** entre os pacientes. O ``GCNConv``
+interpreta esse valor como coeficiente de agregação, de modo que vizinhos
+mais distantes acabam recebendo peso maior. A versão experimental da branch
+``train_test_split`` substitui a distância por uma similaridade RBF local;
+veja a seção "Limitações" do README.
+"""
+
 import networkx as nx
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
+import numpy as np
+import polars as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 from torch_geometric.nn import GCNConv, SGConv
 
 
-def build_patient_knn_graph(target_file: str, selected_genes: list[str], k: int = 5) -> nx.Graph:
+def build_patient_knn_graph(
+    target_file: str, selected_genes: list[str], k: int = 5
+) -> nx.Graph:
+    """Constrói um grafo k-NN não direcionado em que cada nó é um paciente.
+
+    Args:
+        target_file: caminho do Parquet com uma linha por paciente, contendo
+            ``survival_time``, ``event``, opcionalmente ``case_id`` e as
+            colunas de expressão listadas em ``selected_genes``.
+        selected_genes: genes usados como features (normalmente a saída de
+            :func:`lasso_analysis.lasso`).
+        k: número de vizinhos de cada paciente (o próprio paciente é
+            excluído da contagem).
+
+    Returns:
+        ``networkx.Graph`` com atributos de nó ``genes`` (lista de floats já
+        imputados, em ``log1p`` e padronizados), ``survival_time`` e
+        ``event``; atributo de aresta ``weight`` (distância euclidiana).
     """
-    Constrói um grafo KNN não-direcionado onde cada vértice é um paciente.
-    """
-    # 1. Carregar os dados
     df = pl.read_parquet(target_file)
 
-    # Valida se a coluna 'case_id' existe (usada no seu filter.py),
-    # senão usa o índice da linha como identificador do vértice
+    # O case_id é o identificador natural do vértice; se ele não existir, usa
+    # a posição da linha no Parquet.
     has_case_id = "case_id" in df.columns
-    cols_to_select = (["case_id", "survival_time", "event"] if has_case_id else [
-                      "survival_time", "event"]) + selected_genes
+    cols_to_select = (
+        ["case_id", "survival_time", "event"]
+        if has_case_id
+        else ["survival_time", "event"]
+    ) + selected_genes
     df_filtered = df.select(cols_to_select)
 
-    # 2. Matriz de features para o KNN (Apenas Genes)
+    n_patients = len(df_filtered)
+    if n_patients <= k:
+        raise ValueError(
+            f"k={k} precisa ser menor que o número de pacientes ({n_patients})."
+        )
+
+    # 1. Matriz de features para o k-NN (apenas genes).
     X_genes = df_filtered.select(selected_genes).to_numpy()
 
-    # 2.1 Tratamento de nulls (paciente sem valor reportado para algum gene)
-    # Imputação pela média do gene, calculada ignorando os NaNs existentes
+    # 2. Tratamento de nulls: imputação pela média do gene (ignora NaNs).
     if np.isnan(X_genes).any():
         col_means = np.nanmean(X_genes, axis=0)
         nan_idx = np.where(np.isnan(X_genes))
         X_genes[nan_idx] = np.take(col_means, nan_idx[1])
 
-    # 2.2 Normalização: mesma transformação usada na seleção via Lasso (lasso_analysis.py),
-    # para manter o espaço de features consistente entre seleção e distância do grafo
+    # 3. Mesma transformação usada na seleção por Lasso, para manter o espaço
+    #    de features consistente.
     X_genes = np.log1p(X_genes)
     X_genes = StandardScaler().fit_transform(X_genes)
 
-    # 3. Calcular os K Vizinhos Mais Próximos
-    # Usamos k + 1 porque o algoritmo considera o próprio ponto como o vizinho mais próximo (distância 0)
-    nn = NearestNeighbors(n_neighbors=k + 1, metric='euclidean', n_jobs=-1)
+    # 4. k + 1 porque o vizinho mais próximo de um ponto é ele mesmo.
+    nn = NearestNeighbors(n_neighbors=k + 1, metric="euclidean", n_jobs=-1)
     nn.fit(X_genes)
     distances, indices = nn.kneighbors(X_genes)
 
-    # 4. Construir o Grafo
     G = nx.Graph()
-    node_ids = df_filtered["case_id"].to_list(
-    ) if has_case_id else list(range(len(df_filtered)))
+    node_ids = (
+        df_filtered["case_id"].to_list()
+        if has_case_id
+        else list(range(n_patients))
+    )
 
-    # 4.1 Adicionar os Vértices (Nós) com seus Embeddings
+    # 5. Vértices: guarda as features já tratadas para a conversão ao PyG.
     for i, row in enumerate(df_filtered.iter_rows(named=True)):
-        node_id = node_ids[i]
-
-        # Salvamos as features já tratadas (imputadas e normalizadas) para facilitar a
-        # conversão futura para PyTorch Geometric (Data.x e Data.y), evitando reprocessar
-        # nulls/normalização em outro lugar do pipeline
         G.add_node(
-            node_id,
+            node_ids[i],
             genes=X_genes[i].tolist(),
             survival_time=row["survival_time"],
-            event=row["event"]
+            event=row["event"],
         )
 
-    # 4.2 Adicionar as Arestas
+    # 6. Arestas: ignora a posição 0 (o próprio paciente).
     for i, neighbors in enumerate(indices):
         source_patient = node_ids[i]
 
-        # Começamos do range(1, ...) para ignorar o vizinho 0 (que é o próprio paciente)
         for j in range(1, k + 1):
             target_patient = node_ids[neighbors[j]]
             edge_weight = distances[i][j]
-
-            # No networkx, se A liga em B, e B liga em A, a aresta não é duplicada (grafo não-direcionado)
+            # Em um nx.Graph, adicionar A→B e depois B→A não duplica a aresta.
             G.add_edge(source_patient, target_patient, weight=edge_weight)
 
     return G
 
 
 class GCNClassifier(nn.Module):
-    """GCN de 2 camadas + cabeça linear para classificação binária do evento."""
+    """GCN de duas camadas + cabeça linear para classificação binária.
+
+    A saída é um logit por paciente; a sigmoide é aplicada apenas na loss e
+    na avaliação.
+    """
 
     def __init__(self, in_channels: int, hidden_channels: int):
         super().__init__()
@@ -94,12 +137,12 @@ class GCNClassifier(nn.Module):
         x = F.relu(self.conv1(x, edge_index, edge_weight))
         x = F.relu(self.conv2(x, edge_index, edge_weight))
         x = self.lin(x)
-        # logits (sem sigmoid, aplicado depois na loss/avaliacao)
+        # logits (sem sigmoide, aplicada depois na loss/avaliação)
         return x.squeeze(-1)
 
 
 class SGCClassifier(nn.Module):
-    """SGC (propagacao simplificada, K saltos) + cabeca linear para classificacao binaria."""
+    """SGC (propagação simplificada, ``K`` saltos) + cabeça linear."""
 
     def __init__(self, in_channels: int, hidden_channels: int, K: int = 2):
         super().__init__()
@@ -112,11 +155,20 @@ class SGCClassifier(nn.Module):
         return x.squeeze(-1)  # logits
 
 
-def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
-    """
-    Converte o grafo networkx (nos com atributos 'genes' e 'event') em um
-    objeto Data do PyTorch Geometric. 'genes' ja chega tratado (nulls
-    imputados, log1p + StandardScaler) desde build_patient_knn_graph.
+def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list[str]]:
+    """Converte o grafo NetworkX em um ``Data`` do PyTorch Geometric.
+
+    As features ``genes`` já chegam tratadas (imputação + ``log1p`` +
+    padronização) de :func:`build_patient_knn_graph`. Como o grafo é não
+    direcionado, cada aresta é espelhada em ``edge_index``.
+
+    Args:
+        G: grafo com atributos ``genes`` e ``event`` nos nós e ``weight`` nas
+            arestas.
+
+    Returns:
+        ``(data, node_ids)``, em que ``node_ids`` preserva a ordem usada para
+        construir as linhas de ``data.x``/``data.y`` e as previsões.
     """
     node_ids = list(G.nodes())
     node_index = {node_id: i for i, node_id in enumerate(node_ids)}
@@ -124,12 +176,13 @@ def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
     genes = np.array([G.nodes[n]["genes"] for n in node_ids], dtype=np.float32)
     event = np.array([G.nodes[n]["event"] for n in node_ids], dtype=np.float32)
 
-    # Arestas nos dois sentidos, ja que o grafo e nao-direcionado
     edges = list(G.edges(data="weight"))
-    src = [node_index[u] for u, v, w in edges] + [node_index[v]
-                                                  for u, v, w in edges]
-    dst = [node_index[v] for u, v, w in edges] + [node_index[u]
-                                                  for u, v, w in edges]
+    src = [node_index[u] for u, v, w in edges] + [
+        node_index[v] for u, v, w in edges
+    ]
+    dst = [node_index[v] for u, v, w in edges] + [
+        node_index[u] for u, v, w in edges
+    ]
     weights = [w for u, v, w in edges] * 2
 
     data = Data(
@@ -141,11 +194,20 @@ def _graph_to_pyg_data(G: nx.Graph) -> tuple[Data, list]:
     return data, node_ids
 
 
-def _train_model(model: nn.Module, data: Data, train_mask: torch.Tensor, epochs: int, lr: float) -> nn.Module:
+def _train_model(
+    model: nn.Module,
+    data: Data,
+    train_mask: torch.Tensor,
+    epochs: int,
+    lr: float,
+) -> nn.Module:
+    """Treina um modelo transdutivo com Adam e BCE com ``pos_weight``.
+
+    O ``pos_weight`` é calculado apenas com os nós de treino e compensa o
+    desbalanceamento entre sobreviventes e óbitos.
+    """
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
 
-    # pos_weight compensa o desbalanceamento das classes na loss: dá mais peso à classe
-    # minoritária (geralmente o evento=1), calculado a partir do próprio conjunto de treino
     y_train = data.y[train_mask]
     num_positives = y_train.sum()
     num_negatives = len(y_train) - num_positives
@@ -164,7 +226,10 @@ def _train_model(model: nn.Module, data: Data, train_mask: torch.Tensor, epochs:
 
 
 @torch.no_grad()
-def _evaluate(model: nn.Module, data: Data, mask: torch.Tensor) -> tuple[float, float, np.ndarray]:
+def _evaluate(
+    model: nn.Module, data: Data, mask: torch.Tensor
+) -> tuple[float, float, np.ndarray]:
+    """Avalia o modelo em ``mask`` e devolve (balanced accuracy, AUC, probs)."""
     model.eval()
     out = model(data.x, data.edge_index, data.edge_weight)
     probs = torch.sigmoid(out[mask]).numpy()
@@ -172,7 +237,7 @@ def _evaluate(model: nn.Module, data: Data, mask: torch.Tensor) -> tuple[float, 
     targets = data.y[mask].numpy().astype(int)
 
     accuracy = balanced_accuracy_score(targets, preds)
-    # AUC exige as duas classes presentes na mascara; em folds pequenos isso pode falhar
+    # A AUC exige as duas classes na máscara; em folds pequenos isso pode falhar.
     try:
         auc = roc_auc_score(targets, probs)
     except ValueError:
@@ -191,11 +256,18 @@ def _run_single_split(
     lr: float,
     seed: int,
 ) -> dict:
-    """
-    Executa um split treino/teste + CV interna + treino final para uma única seed.
-    Retorna, por arquitetura, as métricas de CV, as métricas de teste e as previsões.
+    """Executa um split + CV interna + treino final para uma única seed.
+
+    O split externo (treino/teste) e a validação cruzada interna são
+    estratificados pela classe ``event``. A CV serve para estimar o
+    desempenho dentro do treino; o modelo final é re-treinado em todo o
+    conjunto de treino e avaliado no conjunto de teste.
     """
     num_nodes = data.num_nodes
+
+    # Fixa a inicialização dos pesos das GNNs para esta seed. Sem isso, duas
+    # execuções com o mesmo split produzem resultados diferentes.
+    torch.manual_seed(seed)
 
     all_idx = np.arange(num_nodes)
     train_idx, test_idx = train_test_split(
@@ -208,8 +280,10 @@ def _run_single_split(
         fold_balanced_accuracies = []
         fold_aucs = []
 
-        # Validacao cruzada estratificada dentro do conjunto de treino
-        for fold_train_idx, fold_val_idx in skf.split(train_idx, data.y.numpy()[train_idx]):
+        # Validação cruzada estratificada dentro do conjunto de treino.
+        for fold_train_idx, fold_val_idx in skf.split(
+            train_idx, data.y.numpy()[train_idx]
+        ):
             train_mask = torch.zeros(num_nodes, dtype=torch.bool)
             val_mask = torch.zeros(num_nodes, dtype=torch.bool)
             train_mask[train_idx[fold_train_idx]] = True
@@ -221,7 +295,7 @@ def _run_single_split(
             fold_balanced_accuracies.append(fold_acc)
             fold_aucs.append(fold_auc)
 
-        # Modelo final: treinado com todo o conjunto de treino, avaliado no teste
+        # Modelo final: treinado com todo o conjunto de treino, avaliado no teste.
         train_mask = torch.zeros(num_nodes, dtype=torch.bool)
         test_mask = torch.zeros(num_nodes, dtype=torch.bool)
         train_mask[train_idx] = True
@@ -230,7 +304,8 @@ def _run_single_split(
         final_model = build_model()
         final_model = _train_model(final_model, data, train_mask, epochs, lr)
         test_balanced_accuracy, test_auc, test_probs = _evaluate(
-            final_model, data, test_mask)
+            final_model, data, test_mask
+        )
 
         seed_results[name] = {
             "cv_balanced_accuracy": float(np.mean(fold_balanced_accuracies)),
@@ -259,18 +334,30 @@ def predict_event_gnn(
     n_repeats: int = 5,
     base_seed: int = 42,
 ) -> dict:
-    """
-    Treina GCN e SGC sobre o grafo de pacientes para prever o evento
-    (0 = vivo/censurado, 1 = obito), evitando o vies de censura que
-    afeta a previsao direta do survival_time.
+    """Treina GCN e SGC no grafo e avalia a predição do evento.
 
-    Repete o split treino/teste (0.2) + CV estratificada interna (5-fold) n_repeats
-    vezes (padrao 5), cada vez com uma seed distinta (base_seed, base_seed+1, ...),
-    para medir a variabilidade do resultado alem do ruido de um unico split.
+    Para cada seed (``base_seed`` até ``base_seed + n_repeats - 1``), executa
+    um split estratificado treino/teste, uma validação cruzada interna de
+    ``n_splits`` folds e o treino final do modelo no conjunto de treino. O
+    resultado agregado reporta média e desvio-padrão entre as seeds, além das
+    previsões individuais.
 
-    Retorna, para cada arquitetura, a media e o desvio padrao (entre as n_repeats
-    execucoes) de balanced accuracy e AUC, tanto da CV interna quanto do teste final,
-    alem das previsoes de cada execucao.
+    Args:
+        G: grafo de pacientes produzido por
+            :func:`build_patient_knn_graph`.
+        hidden_dim: dimensão das camadas ocultas de GCN e SGC.
+        epochs: número de épocas de treino por modelo.
+        lr: taxa de aprendizado do Adam.
+        test_size: fração reservada para o teste externo.
+        n_splits: número de folds da CV interna.
+        n_repeats: número de seeds independentes.
+        base_seed: primeira seed; as demais são incrementais.
+
+    Returns:
+        Dicionário ``{nome_da_arquitetura: métricas}``. Cada entrada contém
+        médias/desvios de balanced accuracy e ROC-AUC na CV e no teste, além
+        de ``predictions_per_seed`` com a probabilidade e a classe prevista
+        por paciente de teste em cada seed.
     """
     data, node_ids = _graph_to_pyg_data(G)
 
@@ -303,8 +390,8 @@ def predict_event_gnn(
             "cv_auc_std": float(np.nanstd(cv_aucs)),
             "test_balanced_accuracy_mean": float(np.mean(test_balanced_accuracies)),
             "test_balanced_accuracy_std": float(np.std(test_balanced_accuracies)),
-            "test_auc_mean": float(np.mean(test_aucs)),
-            "test_auc_std": float(np.std(test_aucs)),
+            "test_auc_mean": float(np.nanmean(test_aucs)),
+            "test_auc_std": float(np.nanstd(test_aucs)),
             "predictions_per_seed": {
                 seed: r["predictions"] for seed, r in zip(seeds, runs)
             },

@@ -1,19 +1,32 @@
-import numpy as np
+"""Modelos clássicos de comparação (sem propagação em grafo).
+
+Este módulo avalia alternativas tabulares — KNN, SVM com kernel RBF, MLP e
+Random Forest — sobre as mesmas features e os mesmos splits usados pelas
+GNNs em :mod:`graph`. O objetivo é isolar o efeito da propagação no grafo:
+se uma GNN não supera um modelo tabular equivalente, o ganho não pode ser
+atribuído à topologia.
+
+As features vêm dos atributos ``genes`` dos nós do grafo, que já passaram
+por imputação, ``log1p`` e padronização em
+:func:`graph.build_patient_knn_graph`.
+"""
+
 import networkx as nx
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import balanced_accuracy_score, roc_auc_score
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.svm import SVC
-from sklearn.neural_network import MLPClassifier
+import numpy as np
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
 
 
 def _graph_to_arrays(G: nx.Graph) -> tuple[np.ndarray, np.ndarray, list]:
-    """
-    Extrai features ('genes') e alvo ('event') do grafo, na MESMA ordem de nós
-    usada por _graph_to_pyg_data (gnn_survival.py). Isso garante que, para a
-    mesma seed, train_test_split/StratifiedKFold gerem exatamente os mesmos
-    índices de treino/teste usados pelas GNNs, permitindo comparação direta.
+    """Extrai features e alvo do grafo na mesma ordem de nós usada pelas GNNs.
+
+    Manter a ordem é essencial para que ``train_test_split`` e
+    ``StratifiedKFold`` gerem, com a mesma seed, exatamente os mesmos índices
+    de treino/teste em :mod:`graph` e aqui.
     """
     node_ids = list(G.nodes())
     X = np.array([G.nodes[n]["genes"] for n in node_ids], dtype=np.float64)
@@ -22,28 +35,40 @@ def _graph_to_arrays(G: nx.Graph) -> tuple[np.ndarray, np.ndarray, list]:
 
 
 def _build_classical_models(k_values: list[int]) -> dict:
-    """
-    Monta os modelos clássicos a avaliar. Cada K do KNN é tratado como um
-    modelo separado (sem busca de hiperparâmetro, conforme pedido).
+    """Monta os modelos clássicos a avaliar.
 
-    Observação de justiça na comparação: usamos class_weight='balanced' nos
-    modelos que suportam esse parâmetro (SVM, Random Forest), para compensar
-    o desbalanceamento das classes de forma equivalente ao pos_weight usado
-    no treino das GNNs. KNN e MLP não têm suporte nativo a isso no sklearn.
+    Cada ``K`` do KNN vira um modelo separado. ``class_weight='balanced'``
+    é usado em SVM e Random Forest para compensar o desbalanceamento de
+    classes, de forma análoga ao ``pos_weight`` das GNNs. KNN e MLP não têm
+    esse parâmetro no scikit-learn.
+
+    Os hiperparâmetros seguem os valores da branch principal e podem diferir
+    do protocolo final do relatório (por exemplo, ``MLP`` aqui usa
+    ``max_iter=1000`` e o relatório usa 2000).
     """
     models = {
         f"KNN_k{k}": (lambda k=k: KNeighborsClassifier(n_neighbors=k))
         for k in k_values
     }
     models["SVM"] = lambda: SVC(
-        probability=True, class_weight="balanced", random_state=42)
+        probability=True, class_weight="balanced", random_state=42
+    )
     models["MLP"] = lambda: MLPClassifier(max_iter=1000, random_state=42)
     models["RandomForest"] = lambda: RandomForestClassifier(
-        class_weight="balanced", random_state=42)
+        class_weight="balanced", random_state=42
+    )
     return models
 
 
-def _evaluate_classical(model, X: np.ndarray, y: np.ndarray, idx: np.ndarray) -> tuple[float, float, np.ndarray]:
+def _evaluate_classical(
+    model, X: np.ndarray, y: np.ndarray, idx: np.ndarray
+) -> tuple[float, float, np.ndarray]:
+    """Avalia um modelo clássico em ``idx``.
+
+    Retorna ``(balanced_accuracy, roc_auc, probabilidades)``. Se o modelo não
+    expuser ``predict_proba`` (ou a AUC falhar), a AUC vira ``NaN`` e as
+    predições binárias são usadas como escore.
+    """
     preds = model.predict(X[idx])
     balanced_acc = balanced_accuracy_score(y[idx], preds)
 
@@ -68,7 +93,7 @@ def _run_single_split_classical(
 ) -> dict:
     """
     Mesma lógica de split (treino/teste + CV interna) usada em
-    _run_single_split (gnn_survival.py), aplicada aos modelos clássicos.
+    :func:`graph._run_single_split`, aplicada aos modelos clássicos.
     """
     all_idx = np.arange(len(y))
     train_idx, test_idx = train_test_split(
@@ -85,8 +110,10 @@ def _run_single_split_classical(
             train_sub_idx = train_idx[fold_train_idx]
             val_sub_idx = train_idx[fold_val_idx]
 
-            # Protecao para K do KNN maior que o numero de amostras de treino do fold
-            if name.startswith("KNN") and int(name.split("_k")[1]) > len(train_sub_idx):
+            # Proteção para K do KNN maior que o número de amostras do fold.
+            if name.startswith("KNN") and int(name.split("_k")[1]) > len(
+                train_sub_idx
+            ):
                 fold_balanced_accuracies.append(float("nan"))
                 fold_aucs.append(float("nan"))
                 continue
@@ -94,14 +121,17 @@ def _run_single_split_classical(
             model = build_model()
             model.fit(X[train_sub_idx], y[train_sub_idx])
             fold_acc, fold_auc, _ = _evaluate_classical(
-                model, X, y, val_sub_idx)
+                model, X, y, val_sub_idx
+            )
             fold_balanced_accuracies.append(fold_acc)
             fold_aucs.append(fold_auc)
 
-        # Modelo final: treinado com todo o conjunto de treino, avaliado no teste
+        # Modelo final: treinado com todo o conjunto de treino, avaliado no teste.
         if name.startswith("KNN") and int(name.split("_k")[1]) > len(train_idx):
-            print(f"[{name}] K maior que o numero de pacientes de treino ({len(train_idx)}); "
-                  f"seed {seed} ignorada para este modelo.")
+            print(
+                f"[{name}] K maior que o numero de pacientes de treino "
+                f"({len(train_idx)}); seed {seed} ignorada para este modelo."
+            )
             seed_results[name] = None
             continue
 
@@ -135,37 +165,54 @@ def predict_event_classical(
     n_repeats: int = 5,
     base_seed: int = 42,
 ) -> dict:
-    """
-    Avalia modelos clássicos (KNN para vários K, SVM, MLP, Random Forest) na
-    predição do evento (0 = vivo/censurado, 1 = óbito), usando exatamente os
-    mesmos splits treino/teste e a mesma CV interna de predict_event_gnn
-    (mesmas seeds, mesmo test_size, mesma estratificação), além das mesmas
-    features já tratadas (genes com nulls imputados, log1p + StandardScaler).
+    """Avalia KNN, SVM, MLP e Random Forest na predição do evento.
 
-    A comparação direta com predict_event_gnn serve para avaliar se a
-    estrutura do grafo KNN + propagação da GNN agrega sinal em relação aos
-    mesmos dados tratados de forma puramente tabular (sem grafo).
+    Usa exatamente os mesmos splits treino/teste e a mesma CV interna de
+    :func:`graph.predict_event_gnn` (mesmas seeds, ``test_size`` e
+    estratificação), além das mesmas features já tratadas. Assim, a
+    diferença de desempenho pode ser atribuída ao modelo e, no caso das
+    GNNs, à propagação no grafo.
+
+    Args:
+        G: grafo de pacientes com atributos ``genes`` e ``event``.
+        k_values: valores de ``K`` para o KNN (cada um vira um modelo).
+        test_size: fração reservada para teste.
+        n_splits: número de folds da CV interna.
+        n_repeats: número de seeds independentes.
+        base_seed: primeira seed; as demais são incrementais.
+
+    Returns:
+        Dicionário ``{nome_do_modelo: métricas}`` com médias/desvios de
+        balanced accuracy e ROC-AUC na CV e no teste, além das previsões por
+        seed. Modelos inviáveis (K maior que o treino) são omitidos.
     """
     X, y, node_ids = _graph_to_arrays(G)
     models = _build_classical_models(k_values)
 
     seeds = [base_seed + i for i in range(n_repeats)]
-    runs_per_model = {name: [] for name in models}
+    # Guarda as execuções por seed (e não apenas uma lista) para que o
+    # dicionário de previsões não fique desalinhado quando alguma seed é
+    # ignorada por causa de um K grande demais.
+    runs_per_model: dict[str, dict[int, dict]] = {name: {} for name in models}
 
     for seed in seeds:
         seed_results = _run_single_split_classical(
-            X, y, node_ids, models, test_size, n_splits, seed)
+            X, y, node_ids, models, test_size, n_splits, seed
+        )
         for name in models:
             if seed_results[name] is not None:
-                runs_per_model[name].append(seed_results[name])
+                runs_per_model[name][seed] = seed_results[name]
 
     summary = {}
-    for name, runs in runs_per_model.items():
-        if not runs:
+    for name, runs_by_seed in runs_per_model.items():
+        if not runs_by_seed:
             print(
-                f"\n[{name}] Nenhuma execução válida (K provavelmente maior que o dataset).")
+                f"\n[{name}] Nenhuma execução válida "
+                "(K provavelmente maior que o dataset)."
+            )
             continue
 
+        runs = list(runs_by_seed.values())
         cv_balanced_accuracies = [r["cv_balanced_accuracy"] for r in runs]
         cv_aucs = [r["cv_auc"] for r in runs]
         test_balanced_accuracies = [r["test_balanced_accuracy"] for r in runs]
@@ -178,10 +225,10 @@ def predict_event_classical(
             "cv_auc_std": float(np.nanstd(cv_aucs)),
             "test_balanced_accuracy_mean": float(np.mean(test_balanced_accuracies)),
             "test_balanced_accuracy_std": float(np.std(test_balanced_accuracies)),
-            "test_auc_mean": float(np.mean(test_aucs)),
-            "test_auc_std": float(np.std(test_aucs)),
+            "test_auc_mean": float(np.nanmean(test_aucs)),
+            "test_auc_std": float(np.nanstd(test_aucs)),
             "predictions_per_seed": {
-                seed: r["predictions"] for seed, r in zip(seeds, runs)
+                seed: r["predictions"] for seed, r in runs_by_seed.items()
             },
         }
 

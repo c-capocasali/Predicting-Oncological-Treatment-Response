@@ -1,3 +1,31 @@
+# ---------------------------------------------------------------------------
+# Dados brutos e artefatos derivados (grandes; não versionar)
+# ---------------------------------------------------------------------------
 rna_files/
-venv/
 patients_table
+patients_table.parquet
+*.parquet
+
+# ---------------------------------------------------------------------------
+# Ambientes virtuais e caches de ferramentas
+# ---------------------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Sessões/caches do marimo (regerados automaticamente)
+__marimo__/
+
+# ---------------------------------------------------------------------------
+# Sistema operacional e editores
+# ---------------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

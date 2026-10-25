@@ -1,19 +1,58 @@
-# Bibliotecas importadas
+"""Construção da tabela de pacientes a partir dos arquivos do GDC.
+
+Este módulo faz a ponte entre três fontes de dados:
+
+1. ``clinical_v2_fixed.tsv`` — metadados clínicos (um registro por caso);
+2. ``bio_filtrado.tsv`` — relação caso → amostra → arquivo de expressão;
+3. ``rna_files/*.tsv`` — matrizes de contagem por gene (STAR-Count do GDC).
+
+O produto final é um arquivo Parquet (por padrão ``patients_table``) em que
+cada linha é um paciente e cada coluna é um gene, acrescido das colunas de
+metadados ``case_id``, ``project``, ``survival_time`` e ``event``.
+"""
+
 import polars as pl
 from pathlib import Path
 
 
-def compute_survival_columns(df_clinical: pl.DataFrame) -> pl.DataFrame:
-    """
-    Recebe o DataFrame clínico completo e devolve um DataFrame com:
-        case_id | survival_time (float) | event (int 0/1)
+# Diretório em que os arquivos de expressão baixados do GDC são procurados.
+# O caminho é relativo ao diretório de onde o pipeline é executado.
+RNA_DIR = Path("rna_files")
 
-    Regras:
-      - Se o paciente morreu (vital_status == "Dead") e days_to_death é válido
-        → survival_time = days_to_death, event = 1
-      - Caso contrário (Alive ou Not Reported) e days_to_last_follow_up é válido
-        → survival_time = days_to_last_follow_up, event = 0
-      - Se nenhum dos dois está disponível → linha descartada (null → filtrado)
+# Linhas de controle do STAR-Count que não correspondem a genes.
+ALIGNMENT_STAT_ROWS = [
+    "N_unmapped",
+    "N_multimapping",
+    "N_noFeature",
+    "N_ambiguous",
+]
+
+
+def compute_survival_columns(df_clinical: pl.DataFrame) -> pl.DataFrame:
+    """Deriva tempo de acompanhamento e indicador de óbito do arquivo clínico.
+
+    Regras de construção:
+
+    - ``vital_status == "Dead"`` e ``days_to_death`` disponível:
+      ``survival_time = days_to_death`` e ``event = 1``;
+    - caso contrário (vivo, "Not Reported" ou óbito sem data), se
+      ``days_to_last_follow_up`` estiver disponível:
+      ``survival_time = days_to_last_follow_up`` e ``event = 0``;
+    - sem nenhuma das duas medidas de tempo: a linha é descartada.
+
+    Observação metodológica: ``event = 0`` significa "sem óbito registrado
+    até o último acompanhamento", e não necessariamente "sobreviveu a um
+    horizonte fixo". O código desta branch não aplica o horizonte de cinco
+    anos descrito no relatório; para isso, veja a branch ``train_test_split``.
+
+    Args:
+        df_clinical: DataFrame clínico completo, com as colunas
+            ``demographic.vital_status``, ``demographic.days_to_death`` e
+            ``diagnoses.0.days_to_last_follow_up``.
+
+    Returns:
+        DataFrame com as colunas ``case_id``, ``survival_time`` e ``event``
+        (0/1), sem linhas com tempo de sobrevivência nulo.
     """
     return (
         df_clinical
@@ -54,26 +93,26 @@ def compute_survival_columns(df_clinical: pl.DataFrame) -> pl.DataFrame:
 
 
 def find_paths(selected_files_names: list[str]) -> list[str]:
-    """
-    Recebe uma lista com os nomes dos arquivos procurados e devolve uma lista 
-    com os caminhos completos (paths em string) de onde eles estão no sistema.
+    """Localiza, em ``rna_files/``, os arquivos de expressão de um paciente.
 
-    Regras:
-      - Define o diretório alvo como a pasta "rna_files" no diretório atual.
-      - Se a pasta "rna_files" não for encontrada, avisa no console e retorna lista vazia.
-      - Converte os nomes procurados para um 'set' (conjunto) para deixar a checagem 
-        muito mais rápida (busca O(1)).
-      - Itera recursivamente (rglob) por todos os arquivos de extensão ".tsv" dentro da pasta.
-      - Quando encontra um arquivo desejado: guarda o caminho final, remove ele do 
-        conjunto de busca e continua.
-      - Otimização (Early Exit): Se o conjunto de busca ficar vazio (ou seja, já encontrou 
-        todos os arquivos do paciente), interrompe o laço imediatamente para poupar processamento.
+    A busca é recursiva e casa pelo **nome exato** do arquivo (``file_name``
+    vindo do biospecimen), não pelo caminho completo. Isso permite organizar
+    os downloads do GDC em subpastas por projeto/amostra.
+
+    Args:
+        selected_files_names: nomes de arquivo (por exemplo,
+            ``"abc-123.htseq.counts.gz"`` ou ``"abc-123.rna_seq.augmented_star_gene_counts.tsv"``)
+            associados ao paciente.
+
+    Returns:
+        Lista com os caminhos encontrados. Pode ser menor que a lista de
+        entrada caso algum arquivo não esteja presente; retorna ``[]`` se o
+        diretório ``rna_files/`` não existir.
     """
-    current_dir = Path('.')
-    path = current_dir / "rna_files"
+    path = RNA_DIR
 
     if not path.is_dir():
-        print("Diretório rna_files não encontrado")
+        print(f"Diretório {path} não encontrado")
         return []
 
     files_to_find = set(selected_files_names)
@@ -89,36 +128,37 @@ def find_paths(selected_files_names: list[str]) -> list[str]:
     return found_paths
 
 
-def get_rna_exp(file_paths: list[str]) -> dict:
-    """
-    Recebe uma lista de caminhos de arquivos de RNA e devolve um dicionário com:
-        gene_name (chave) | stranded_second média (valor float)
+def get_rna_exp(file_paths: list[str]) -> dict[str, float]:
+    """Agrega a expressão gênica de um paciente a partir de seus arquivos.
 
-    Regras:
-      - Se a lista de arquivos estiver vazia, retorna um dicionário vazio.
-      - Remove estatísticas de alinhamento que não são genes reais 
-        (ex: "N_unmapped", "N_multimapping", etc.).
-      - Para cada arquivo na lista (iteração):
-          * Lê o arquivo de forma preguiçosa (lazy) ignorando o cabeçalho (skip_rows=1).
-          * Filtra descartando as linhas indesejadas listadas em 'remove'.
-          * Agrupa pelo nome do gene e soma os valores da coluna 'stranded_second' naquele arquivo.
-      - Junta (concatena) as leituras de todos os arquivos do paciente.
-      - Como o paciente pode ter múltiplos arquivos com o mesmo gene, faz um agrupamento final 
-        pelo nome do gene, calculando a MÉDIA da expressão ('stranded_second') entre os arquivos.
-      - Converte o resultado final em um dicionário (chave = gene_name, valor = stranded_second).
+    Para cada arquivo STAR-Count do GDC, soma as contagens de
+    ``stranded_second`` por ``gene_name`` (a coluna é a recomendada para
+    análise de expressão gênica do GDC). Se o paciente tiver mais de uma
+    amostra/arquivo, calcula a média entre os arquivos para cada gene.
+
+    O leitor assume o layout dos arquivos STAR-Count do GDC: a primeira
+    linha é um metadado comentado (por exemplo, ``# gene-model: GENCODE
+    v36``), a segunda contém os nomes das colunas e, por isso,
+    ``skip_rows=1``. As colunas ``gene_id``, ``gene_name`` e
+    ``stranded_second`` precisam existir; ajuste o parâmetro se o arquivo
+    tiver outro layout.
+
+    Args:
+        file_paths: caminhos dos arquivos de expressão do paciente.
+
+    Returns:
+        Dicionário ``{gene_name: expressão_média}``. Retorna ``{}`` se a
+        lista estiver vazia.
     """
 
     if not file_paths:
         return {}
 
-    # Remove colunas indesejáveis
-    remove = ["N_unmapped", "N_multimapping", "N_noFeature", "N_ambiguous"]
-
     lazy_reads = []
     for current_path in file_paths:
         lf = (
             pl.scan_csv(current_path, separator="\t", skip_rows=1)
-            .filter(~pl.col("gene_id").is_in(remove))
+            .filter(~pl.col("gene_id").is_in(ALIGNMENT_STAT_ROWS))
             .group_by("gene_name")
             .agg(pl.col("stranded_second").sum())
         )
@@ -135,21 +175,41 @@ def get_rna_exp(file_paths: list[str]) -> dict:
     return dict(zip(final_result["gene_name"], final_result["stranded_second"]))
 
 
-def create_project_map_to_parquet(df_bio: pl.DataFrame, df_clinical: pl.DataFrame, project_names: list[str], output_file: str) -> pl.DataFrame:
-    """
-    Recebe dados biológicos e clínicos, processa as informações de sobrevivência e gera um arquivo Parquet.
+def create_project_map_to_parquet(
+    df_bio: pl.DataFrame,
+    df_clinical: pl.DataFrame,
+    project_names: list[str],
+    output_file: str,
+) -> pl.DataFrame | None:
+    """Monta a matriz paciente × gene e a persiste em Parquet.
 
-    Regras:
-      - Gera as colunas de sobrevivência usando a função compute_survival_columns.
-      - Faz o join (cruzamento) de df_bio com df_clinical usando o case_id.
-      - Para cada projeto em project_names:
-          * Filtra os pacientes que pertencem ao projeto e cujo days_to_diagnosis é 0.
-          * Agrupa por paciente (case_id) para remover duplicatas, extraindo o primeiro survival_time e event, 
-            e agrupando todos os file_names do paciente em uma lista.
-          * Itera sobre cada paciente (linha agrupada) para buscar seus arquivos de RNA (get_rna_exp).
-          * Junta as informações clínicas com os dados de RNA num dicionário.
-      - Concatena os resultados de todos os projetos.
-      - Salva o DataFrame final em formato Parquet com compressão snappy e o retorna.
+    Etapas:
+
+    1. deriva ``survival_time`` e ``event`` com
+       :func:`compute_survival_columns`;
+    2. faz o join de ``df_bio`` com os dados de sobrevivência pelo
+       ``case_id``;
+    3. para cada projeto, mantém apenas amostras coletadas no diagnóstico
+       (``days_to_diagnosis == 0``) e agrupa os arquivos por paciente;
+    4. lê os arquivos de RNA, agrega a expressão por gene e acrescenta as
+       colunas clínicas;
+    5. concatena os projetos e grava ``output_file`` em Parquet (Snappy).
+
+    O processo é **caro**: no conjunto completo do relatório, são cerca de
+    3 mil arquivos de expressão e dezenas de GB de leitura. Rode-o uma única
+    vez e reutilize o Parquet gerado.
+
+    Args:
+        df_bio: conteúdo de ``bio_filtrado.tsv``.
+        df_clinical: conteúdo de ``clinical_v2_fixed.tsv``.
+        project_names: identificadores dos projetos do GDC a incluir, por
+            exemplo ``["TCGA-BRCA", "TARGET-AML"]``.
+        output_file: caminho do Parquet de saída (por convenção,
+            ``"patients_table"``).
+
+    Returns:
+        O DataFrame consolidado, ou ``None`` se nenhum paciente tiver dados
+        de expressão utilizáveis.
     """
     all_data_frames = []
 
